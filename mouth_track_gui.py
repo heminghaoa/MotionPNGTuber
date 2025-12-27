@@ -1,0 +1,1397 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mouth_track_gui.py  (One-Click HQ)
+
+最高品質・設定最小の「一気通貫」GUI
+- 動画を選ぶ
+- 解析 (auto_mouth_track_v2.py)  ※自動修復 + early-stop
+- 解析後にキャリブ画面を自動表示 (calibrate_mouth_track.py)
+- キャリブが終わったら口消しを自動生成 (auto_erase_mouth.py)
+- 最後に口消し動画を自動プレビュー
+
+ユーザーが触る設定:
+- 口消し強さ (coverage)
+
+注意:
+- サブプロセス出力の文字化け/Unicode問題を避けるため、UTF-8環境変数を付与します。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import json
+import queue
+import threading
+import subprocess
+import signal
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAST_SESSION_FILE = os.path.join(HERE, ".mouth_track_last_session.json")
+
+
+# --- smoothing presets (GUI) ---
+SMOOTHING_PRESETS: dict[str, float | None] = {
+    "Auto（今のまま）": None,  # pass nothing -> keep current default behavior
+    "ゆっくり（1.5）": 1.5,
+    "普通（3.0）": 3.0,
+    "高速（6.0）": 6.0,
+    "追従最優先（0）": 0.0,  # disable smoothing
+}
+SMOOTHING_LABELS = list(SMOOTHING_PRESETS.keys())
+
+
+
+
+# --- emotion preset (GUI / runtime) ---
+EMOTION_PRESETS: dict[str, str] = {
+    "安定（配信向け）": "stable",
+    "標準": "standard",
+    "キビキビ（ゲーム向け）": "snappy",
+}
+EMOTION_PRESET_LABELS = list(EMOTION_PRESETS.keys())
+# ---------- helpers ----------
+def _script_contains(path: str, needles: list[str]) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            s = f.read()
+        return all(n in s for n in needles)
+    except Exception:
+        return False
+
+
+def _try_list_input_devices() -> list[tuple[int, str]]:
+    """
+    Returns list of (index, display_name) for input devices.
+    Uses sounddevice if available.
+    """
+    try:
+        import sounddevice as sd  # type: ignore
+        devices = []
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) > 0:
+                name = str(d.get("name", ""))[:64]
+                ch = int(d.get("max_input_channels", 0))
+                sr = int(float(d.get("default_samplerate", 0)) or 0)
+                devices.append((i, f"{i}: {name}  (ch={ch}, sr={sr})"))
+        return devices
+    except Exception:
+        return []
+
+
+def _ensure_backend_sanity(base_dir: str) -> tuple[bool, str]:
+    """
+    Prevent the common "file got swapped/overwritten" situation.
+    """
+    track_py = os.path.join(base_dir, "auto_mouth_track_v2.py")
+    erase_py = os.path.join(base_dir, "auto_erase_mouth.py")
+
+    if not os.path.isfile(track_py):
+        return False, "auto_mouth_track_v2.py が見つかりません。"
+    if not os.path.isfile(erase_py):
+        return False, "auto_erase_mouth.py が見つかりません。"
+
+    # Track script should mention pad/det-scale/min-conf.
+    if not _script_contains(track_py, ["--pad", "--det-scale", "--min-conf"]):
+        return (
+            False,
+            "auto_mouth_track_v2.py が追跡用スクリプトではないようです（--pad 等が見つかりません）。\n"
+            "ファイルが入れ替わっていないか確認してください。",
+        )
+
+    # Erase script should mention --track / --coverage.
+    if not _script_contains(erase_py, ["--track", "--coverage"]):
+        return (
+            False,
+            "auto_erase_mouth.py が口消し用スクリプトではないようです（--track/--coverage が見つかりません）。\n"
+            "ファイルが入れ替わっていないか確認してください。",
+        )
+
+    return True, ""
+
+
+def guess_mouth_dir(video_path: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(video_path))
+    cand = os.path.join(base_dir, "mouth")
+    if os.path.isdir(cand):
+        return cand
+    cand = os.path.join(HERE, "mouth")
+    if os.path.isdir(cand):
+        return cand
+    return ""
+
+
+def best_open_sprite(mouth_dir: str) -> str:
+    if not mouth_dir or not os.path.isdir(mouth_dir):
+        return ""
+    p = os.path.join(mouth_dir, "open.png")
+    if os.path.isfile(p):
+        return p
+    try:
+        for name in os.listdir(mouth_dir):
+            if name.lower() == "open.png":
+                p2 = os.path.join(mouth_dir, name)
+                if os.path.isfile(p2):
+                    return p2
+    except Exception:
+        pass
+    return ""
+
+def _safe_bool(v, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+_EMOTION_DIR_NAMES = {"default", "neutral", "happy", "angry", "sad", "excited"}
+
+
+def _is_emotion_level_mouth_root(mouth_root: str) -> bool:
+    """Heuristic: mouth_root is already a character directory (no character layer),
+    if it contains open.png directly OR contains multiple emotion-named subfolders."""
+    if not mouth_root or not os.path.isdir(mouth_root):
+        return False
+    if os.path.isfile(os.path.join(mouth_root, "open.png")):
+        return True
+    try:
+        subs = [d for d in os.listdir(mouth_root) if os.path.isdir(os.path.join(mouth_root, d))]
+        low = {d.lower() for d in subs}
+        return len(low & _EMOTION_DIR_NAMES) >= 2
+    except Exception:
+        return False
+
+
+def list_character_dirs(mouth_root: str) -> list[str]:
+    """Return character folder candidates under mouth_root.
+    If mouth_root looks like an emotion-level folder, return []."""
+    if not mouth_root or not os.path.isdir(mouth_root):
+        return []
+    if _is_emotion_level_mouth_root(mouth_root):
+        return []
+    try:
+        subs = [d for d in os.listdir(mouth_root) if os.path.isdir(os.path.join(mouth_root, d))]
+        # Exclude emotion folder names just in case
+        chars = [d for d in subs if d.lower() not in _EMOTION_DIR_NAMES]
+        chars.sort(key=lambda x: x.lower())
+        return chars
+    except Exception:
+        return []
+
+
+def resolve_character_dir(mouth_root: str, character: str) -> str:
+    """Resolve mouth directory passed to runtime / used for sprite search.
+    If character is valid, use mouth_root/character, else use mouth_root."""
+    if not mouth_root:
+        return ""
+    if character:
+        cand = os.path.join(mouth_root, character)
+        if os.path.isdir(cand):
+            return cand
+    return mouth_root
+
+
+def best_open_sprite_for_character(mouth_root: str, character: str) -> str:
+    """Find open.png for calibration.
+    Priority:
+      1) <mouth_dir>/open.png (backward compat)
+      2) <mouth_dir>/(Default|neutral|...)/open.png
+      3) first found in immediate subfolders
+    where <mouth_dir> is mouth_root or mouth_root/character.
+    """
+    base = resolve_character_dir(mouth_root, character)
+    if not base or not os.path.isdir(base):
+        return ""
+
+    # 1) direct
+    p = os.path.join(base, "open.png")
+    if os.path.isfile(p):
+        return p
+    try:
+        for name in os.listdir(base):
+            if name.lower() == "open.png":
+                p2 = os.path.join(base, name)
+                if os.path.isfile(p2):
+                    return p2
+    except Exception:
+        pass
+
+    # 2) preferred emotion folders
+    preferred = ["Default", "default", "neutral", "Neutral", "Normal", "normal"]
+    for em in preferred:
+        d = os.path.join(base, em)
+        if not os.path.isdir(d):
+            continue
+        p = os.path.join(d, "open.png")
+        if os.path.isfile(p):
+            return p
+        try:
+            for name in os.listdir(d):
+                if name.lower() == "open.png":
+                    p2 = os.path.join(d, name)
+                    if os.path.isfile(p2):
+                        return p2
+        except Exception:
+            pass
+
+    # 3) any immediate subfolder
+    try:
+        for sub in os.listdir(base):
+            d = os.path.join(base, sub)
+            if not os.path.isdir(d):
+                continue
+            p = os.path.join(d, "open.png")
+            if os.path.isfile(p):
+                return p
+            for name in os.listdir(d):
+                if name.lower() == "open.png":
+                    p2 = os.path.join(d, name)
+                    if os.path.isfile(p2):
+                        return p2
+    except Exception:
+        pass
+
+    return ""
+
+
+
+def load_session() -> dict:
+    try:
+        with open(LAST_SESSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_session(d: dict) -> None:
+    """Persist session data.
+
+    NOTE: We merge with the existing session so GUI actions that save a single
+    field (e.g., audio device) do not wipe other settings.
+    """
+    try:
+        cur = load_session()
+        if not isinstance(cur, dict):
+            cur = {}
+        cur.update(d)
+        with open(LAST_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------- GUI ----------
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Mouth Track One-Click (HQ)")
+        self.geometry("840x560")
+
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+        self.worker_thread: threading.Thread | None = None
+        self.stop_flag = threading.Event()
+        self.active_proc: subprocess.Popen | None = None
+
+        sess = load_session()
+        # GUIでは元動画を表示したいが、runtimeは背景としてmouthlessを使いたいので
+        # sessionには video(=背景用) と source_video(=元動画) を分けて保存する
+        self.video_var = tk.StringVar(value=sess.get("source_video", sess.get("video", "")))
+        self.mouth_dir_var = tk.StringVar(value=sess.get("mouth_dir", ""))
+
+        # --- character / emotion-auto (runtime) ---
+        self.character_var = tk.StringVar(value=str(sess.get("character", "")))
+
+        _ep = str(sess.get("emotion_preset", "標準"))
+        if _ep not in EMOTION_PRESETS:
+            _ep = "標準"
+        self.emotion_preset_var = tk.StringVar(value=_ep)
+
+        self.emotion_hud_var = tk.BooleanVar(value=_safe_bool(sess.get("emotion_hud", True), default=True))
+        self.coverage_var = tk.DoubleVar(value=float(sess.get("coverage", 0.60)))
+        self.pad_var = tk.DoubleVar(value=float(sess.get("pad", 2.10)))
+
+        # erase shading preset (GUI only): plane=ON, none=OFF
+        _esh = sess.get("erase_shading", sess.get("shading", "plane"))
+        _esh_str = str(_esh).lower()
+        self.erase_shading_var = tk.BooleanVar(value=(_esh_str != "none"))
+
+        # tracking smoothing preset (GUI only)
+        _smooth = sess.get("smoothing", "Auto（今のまま）")
+        if _smooth not in SMOOTHING_PRESETS:
+            _smooth = "Auto（今のまま）"
+        self.smoothing_menu_var = tk.StringVar(value=_smooth)
+
+        # runtime用：オーディオ入力デバイス
+        self.audio_device_var = tk.IntVar(value=int(sess.get("audio_device", 31)))
+        self.audio_device_menu_var = tk.StringVar(value="")
+
+        self._build_ui()
+
+        self._refresh_characters(init=True)
+        # Refresh character list when mouth root changes
+        self._char_refresh_job = None
+        self.mouth_dir_var.trace_add("write", lambda *_: self._schedule_refresh_characters())
+        self._refresh_audio_devices(init=True)
+
+        if self.video_var.get() and not self.mouth_dir_var.get():
+            self._autofill_mouth_dir()
+        self._refresh_characters(init=True)
+
+        self.after(100, self._poll_logs)
+
+    # ----- UI -----
+    def _build_ui(self) -> None:
+        pad = 10
+        frm = ttk.Frame(self)
+        frm.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        # Video row
+        row1 = ttk.Frame(frm)
+        row1.pack(fill="x", pady=(0, 8))
+        ttk.Label(row1, text="動画").pack(side="left")
+        ttk.Entry(row1, textvariable=self.video_var).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row1, text="選択…", command=self.on_pick_video).pack(side="left")
+
+        # Mouth dir row
+        row2 = ttk.Frame(frm)
+        row2.pack(fill="x", pady=(0, 8))
+        ttk.Label(row2, text="mouthフォルダ").pack(side="left")
+        ttk.Entry(row2, textvariable=self.mouth_dir_var).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row2, text="選択…", command=self.on_pick_mouth_dir).pack(side="left")
+
+
+        # Character row (mouth_dir/<Character>/...)
+        row2a = ttk.Frame(frm)
+        row2a.pack(fill="x", pady=(0, 8))
+        ttk.Label(row2a, text="キャラクター").pack(side="left")
+        self.cmb_character = ttk.Combobox(row2a, textvariable=self.character_var, state="readonly")
+        self.cmb_character.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row2a, text="再読込", command=self._refresh_characters).pack(side="left")
+
+        def _on_char_select(_evt=None):
+            save_session({"character": self.character_var.get()})
+
+        self.cmb_character.bind("<<ComboboxSelected>>", _on_char_select)
+
+        # Pad slider (tracking)
+        row2b = ttk.Frame(frm)
+        row2b.pack(fill="x", pady=(0, 8))
+        ttk.Label(row2b, text="pad（追跡余白）").pack(side="left")
+        pad_scale = ttk.Scale(row2b, from_=1.00, to=3.00, variable=self.pad_var, orient="horizontal")
+        pad_scale.pack(side="left", fill="x", expand=True, padx=8)
+        self.pad_label = ttk.Label(row2b, text=f"{self.pad_var.get():.2f}")
+        self.pad_label.pack(side="left")
+        self.pad_var.trace_add("write", lambda *_: self.pad_label.config(text=f"{self.pad_var.get():.2f}"))
+        pad_scale.bind("<ButtonRelease-1>", lambda _evt=None: save_session({"pad": float(self.pad_var.get())}))
+
+        # Coverage slider
+        row3 = ttk.Frame(frm)
+        row3.pack(fill="x", pady=(0, 8))
+        ttk.Label(row3, text="口消し強さ").pack(side="left")
+        ttk.Scale(row3, from_=0.40, to=0.90, variable=self.coverage_var, orient="horizontal").pack(
+            side="left", fill="x", expand=True, padx=8
+        )
+        self.cov_label = ttk.Label(row3, text=f"{self.coverage_var.get():.2f}")
+        self.cov_label.pack(side="left")
+        self.coverage_var.trace_add("write", lambda *_: self.cov_label.config(text=f"{self.coverage_var.get():.2f}"))
+
+
+        # Erase shading toggle (plane/none) - keeps UX simple
+        row3a = ttk.Frame(frm)
+        row3a.pack(fill="x", pady=(0, 8))
+        ttk.Label(row3a, text="影なじませ（口消し）").pack(side="left")
+        ttk.Checkbutton(
+            row3a,
+            text="有効（plane）",
+            variable=self.erase_shading_var,
+            command=lambda: save_session({"erase_shading": "plane" if self.erase_shading_var.get() else "none"}),
+        ).pack(side="left", padx=8)
+        ttk.Label(row3a, text="OFFで顎の黒にじみを軽減").pack(side="left")
+
+        # Smoothing preset (tracking)
+        row3b = ttk.Frame(frm)
+        row3b.pack(fill="x", pady=(0, 8))
+        ttk.Label(row3b, text="スムージング（トラック）").pack(side="left")
+        self.cmb_smooth = ttk.Combobox(
+            row3b,
+            textvariable=self.smoothing_menu_var,
+            state="readonly",
+            values=SMOOTHING_LABELS,
+        )
+        self.cmb_smooth.pack(side="left", fill="x", expand=True, padx=8)
+        self.cmb_smooth.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt=None: save_session({"smoothing": self.smoothing_menu_var.get()}),
+        )
+        # Audio device row (runtime)
+        row4 = ttk.Frame(frm)
+        row4.pack(fill="x", pady=(0, 10))
+        ttk.Label(row4, text="オーディオ入力デバイス（ライブ用）").pack(side="left")
+        self.cmb_audio = ttk.Combobox(row4, textvariable=self.audio_device_menu_var, state="readonly")
+        self.cmb_audio.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row4, text="再読込", command=self._refresh_audio_devices).pack(side="left")
+
+
+        # Emotion auto (runtime) - always AUTO, user only picks preset and HUD
+        row4b = ttk.Frame(frm)
+        row4b.pack(fill="x", pady=(0, 10))
+        ttk.Label(row4b, text="感情オート（音声）").pack(side="left")
+
+        self.cmb_emotion_preset = ttk.Combobox(
+            row4b,
+            textvariable=self.emotion_preset_var,
+            state="readonly",
+            values=EMOTION_PRESET_LABELS,
+        )
+        self.cmb_emotion_preset.pack(side="left", fill="x", expand=True, padx=8)
+        self.cmb_emotion_preset.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt=None: save_session({"emotion_preset": self.emotion_preset_var.get()}),
+        )
+
+        ttk.Checkbutton(
+            row4b,
+            text="HUD（😊表示）",
+            variable=self.emotion_hud_var,
+            command=lambda: save_session({"emotion_hud": bool(self.emotion_hud_var.get())}),
+        ).pack(side="left", padx=8)
+
+        # Buttons (workflow)
+        row_btn = ttk.Frame(frm)
+        row_btn.pack(fill="x", pady=(0, 10))
+
+        self.btn_track_calib = ttk.Button(row_btn, text="① 解析→キャリブ", command=self.on_track_and_calib)
+        self.btn_track_calib.pack(side="left")
+
+        self.btn_calib_only = ttk.Button(row_btn, text="キャリブのみ（やり直し）", command=self.on_calib_only)
+        self.btn_calib_only.pack(side="left", padx=8)
+
+        self.btn_erase = ttk.Button(row_btn, text="② 口消し動画生成", command=self.on_erase_mouthless)
+        self.btn_erase.pack(side="left")
+
+        self.btn_erase_range = ttk.Button(row_btn, text="口消し範囲プレビュー", command=self.on_preview_erase_range)
+        self.btn_erase_range.pack(side="left", padx=8)
+
+        self.btn_live = ttk.Button(row_btn, text="③ ライブ実行", command=self.on_live_run)
+        self.btn_live.pack(side="left", padx=8)
+
+        self.btn_stop = ttk.Button(
+            row_btn, text="中断（現在の処理が終わったら停止）", command=self.on_stop, state="disabled"
+        )
+        self.btn_stop.pack(side="right")
+
+        # Log
+        ttk.Label(frm, text="ログ").pack(anchor="w")
+        self.txt = tk.Text(frm, height=22, wrap="word")
+        self.txt.pack(fill="both", expand=True)
+        self.txt.configure(state="disabled")
+
+    # ----- logging (thread-safe) -----
+    def log(self, s: str) -> None:
+        self.log_q.put(s)
+
+    def _poll_logs(self) -> None:
+        try:
+            while True:
+                s = self.log_q.get_nowait()
+                self.txt.configure(state="normal")
+                self.txt.insert("end", s + "\n")
+                self.txt.see("end")
+                self.txt.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_logs)
+
+    # ----- misc helpers -----
+    def _autofill_mouth_dir(self) -> None:
+        v = self.video_var.get().strip()
+        if not v:
+            return
+        md = guess_mouth_dir(v)
+        if md:
+            self.mouth_dir_var.set(md)
+
+    def _refresh_audio_devices(self, init: bool = False) -> None:
+        devices = _try_list_input_devices()
+        if not devices:
+            if init:
+                self.audio_device_menu_var.set(f"{self.audio_device_var.get()}: (未取得)")
+            return
+
+        self._audio_items = devices  # optional stash
+        values = [disp for _, disp in devices]
+        self.cmb_audio["values"] = values
+
+        cur = int(self.audio_device_var.get())
+        sel = None
+        for idx, disp in devices:
+            if idx == cur:
+                sel = disp
+                break
+        if sel is None:
+            idx0, disp0 = devices[0]
+            self.audio_device_var.set(idx0)
+            sel = disp0
+        self.audio_device_menu_var.set(sel)
+
+        def _on_select(_evt=None):
+            s = self.audio_device_menu_var.get()
+            try:
+                n = int(s.split(":", 1)[0].strip())
+                self.audio_device_var.set(n)
+                save_session({"audio_device": int(n)})
+            except Exception:
+                pass
+
+        self.cmb_audio.bind("<<ComboboxSelected>>", _on_select)
+        if init:
+            _on_select()
+
+
+    def _schedule_refresh_characters(self) -> None:
+        """Debounced refresh for character list."""
+        try:
+            if getattr(self, "_char_refresh_job", None):
+                self.after_cancel(self._char_refresh_job)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        self._char_refresh_job = self.after(150, self._refresh_characters)
+
+    def _refresh_characters(self, init: bool = False) -> None:
+        """Populate character combobox from mouth_dir root."""
+        mouth_root = self.mouth_dir_var.get().strip()
+
+        # If mouth_root is already emotion-level (no character layer), character selection is not needed.
+        if _is_emotion_level_mouth_root(mouth_root):
+            try:
+                self.cmb_character.configure(state="disabled")
+                self.cmb_character["values"] = ["(不要：直下が感情フォルダ)"]
+            except Exception:
+                pass
+            self.character_var.set("")
+            return
+
+        chars = list_character_dirs(mouth_root)
+        if not chars:
+            # Keep enabled but show placeholder.
+            try:
+                self.cmb_character.configure(state="readonly")
+                self.cmb_character["values"] = ["(なし)"]
+            except Exception:
+                pass
+            self.character_var.set("")
+            return
+
+        try:
+            self.cmb_character.configure(state="readonly")
+            self.cmb_character["values"] = chars
+        except Exception:
+            pass
+
+        cur = (self.character_var.get() or "").strip()
+        if cur not in chars:
+            # Auto-select when there is only one character
+            if len(chars) == 1:
+                self.character_var.set(chars[0])
+                save_session({"character": chars[0]})
+            elif init:
+                self.character_var.set("")
+
+    def _emotion_preset_key(self) -> str:
+        return EMOTION_PRESETS.get(self.emotion_preset_var.get(), "standard")
+
+    def _resolve_character_for_action(self) -> str | None:
+        """Return effective character name for current mouth_root.
+        - ""   : no character layer (mouth_root is emotion-level)
+        - name  : selected / auto-selected character
+        - None  : error (multiple candidates but not selected)
+        """
+        mouth_root = self.mouth_dir_var.get().strip()
+        if _is_emotion_level_mouth_root(mouth_root):
+            return ""
+
+        chars = list_character_dirs(mouth_root)
+        if not chars:
+            return ""
+
+        cur = (self.character_var.get() or "").strip()
+        if cur in chars:
+            return cur
+
+        if len(chars) == 1:
+            self.character_var.set(chars[0])
+            save_session({"character": chars[0]})
+            return chars[0]
+
+        self._show_error("エラー", "キャラクターを選択してください（mouth_dir直下のフォルダから選びます）。")
+        return None
+
+    def _runtime_supports(self, runtime_py: str, flags: list[str]) -> bool:
+        return _script_contains(runtime_py, flags)
+
+    def _set_running(self, running: bool) -> None:
+        def _apply():
+            st = "disabled" if running else "normal"
+            self.btn_track_calib.configure(state=st)
+            self.btn_calib_only.configure(state=st)
+            self.btn_erase.configure(state=st)
+            self.btn_erase_range.configure(state=st)
+            self.btn_live.configure(state=st)
+            self.btn_stop.configure(state=("normal" if running else "disabled"))
+        self.after(0, _apply)
+
+    def _show_error(self, title: str, msg: str) -> None:
+        self.after(0, lambda: messagebox.showerror(title, msg))
+
+    def _show_warn(self, title: str, msg: str) -> None:
+        self.after(0, lambda: messagebox.showwarning(title, msg))
+
+    # ----- file pickers -----
+    def on_pick_video(self) -> None:
+        p = filedialog.askopenfilename(
+            title="動画を選択",
+            filetypes=[("Video", "*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v"), ("All", "*.*")],
+        )
+        if not p:
+            return
+        self.video_var.set(p)
+        self._autofill_mouth_dir()
+        # 選択直後は video=source_video として保存（まだmouthless未生成のため）
+        save_session({
+            "video": self.video_var.get(),
+            "source_video": self.video_var.get(),
+            "mouth_dir": self.mouth_dir_var.get(),
+            "coverage": float(self.coverage_var.get()),
+            "pad": float(self.pad_var.get()),
+            "audio_device": int(self.audio_device_var.get()),
+            "character": self.character_var.get(),
+            "emotion_preset": self.emotion_preset_var.get(),
+            "emotion_hud": bool(self.emotion_hud_var.get()),
+        })
+
+    def on_pick_mouth_dir(self) -> None:
+        d = filedialog.askdirectory(title="mouthフォルダを選択")
+        if not d:
+            return
+        self.mouth_dir_var.set(d)
+        self._refresh_characters(init=True)
+        save_session({
+            "video": self.video_var.get(),
+            "source_video": self.video_var.get(),
+            "mouth_dir": self.mouth_dir_var.get(),
+            "coverage": float(self.coverage_var.get()),
+            "pad": float(self.pad_var.get()),
+            "audio_device": int(self.audio_device_var.get()),
+            "character": self.character_var.get(),
+            "emotion_preset": self.emotion_preset_var.get(),
+            "emotion_hud": bool(self.emotion_hud_var.get()),
+        })
+
+    def on_stop(self) -> None:
+        self.stop_flag.set()
+        self.log("[gui] stop requested. force-stopping active process (if any).")
+        if self.active_proc and (self.active_proc.poll() is None):
+            self._terminate_proc_tree(self.active_proc)
+
+    def _terminate_proc_tree(self, p: subprocess.Popen) -> None:
+        """子プロセス（可能ならプロセスツリー）を強制終了"""
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                # プロセスグループごと kill（_run_cmd_stream で setsid している前提）
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    p.kill()
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    # ----- subprocess runner -----
+    def _run_cmd_stream(self, cmd: list[str], cwd: str | None = None) -> int:
+        """
+        Run command and stream stdout/stderr to GUI log.
+        """
+        self.log("[cmd] " + " ".join(cmd))
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
+        popen_kw = {}
+        if sys.platform.startswith("win"):
+            popen_kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kw["preexec_fn"] = os.setsid
+
+        try:
+            p = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **popen_kw,
+            )
+        except Exception as e:
+            self.log(f"[error] failed to start: {e}")
+            return 999
+
+        self.active_proc = p
+
+        assert p.stdout is not None
+        OUT = queue.Queue()
+        SENTINEL = object()
+
+        def _reader():
+            try:
+                for line in p.stdout:
+                    OUT.put(line)
+            finally:
+                OUT.put(SENTINEL)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        terminated = False
+        while True:
+            if self.stop_flag.is_set() and not terminated:
+                terminated = True
+                self._terminate_proc_tree(p)
+
+            try:
+                item = OUT.get(timeout=0.1)
+            except queue.Empty:
+                item = None
+
+            if item is SENTINEL:
+                break
+            if isinstance(item, str):
+                self.log(item.rstrip("\n"))
+
+            if p.poll() is not None and OUT.empty():
+                break
+
+        rc = p.wait()
+        if self.active_proc is p:
+            self.active_proc = None
+        return rc
+
+    # ----- preview -----
+    def _open_video_preview(self, video_path: str) -> None:
+        # Try OpenCV playback first (if available)
+        try:
+            import cv2  # type: ignore
+            cap = cv2.VideoCapture(video_path)
+            if cap.isOpened():
+                win = "preview (q/ESC=close, space=pause)"
+                paused = False
+                while True:
+                    if not paused:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                    cv2.imshow(win, frame)
+                    k = cv2.waitKey(15) & 0xFF
+                    if k in (ord("q"), 27):
+                        break
+                    if k == ord(" "):
+                        paused = not paused
+                cap.release()
+                cv2.destroyWindow(win)
+                return
+        except Exception:
+            pass
+
+        # Fallback to OS open
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(video_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", video_path])
+            else:
+                subprocess.Popen(["xdg-open", video_path])
+        except Exception as e:
+            self.log(f"[warn] cannot open preview automatically: {e}")
+            self.log(f"[info] output: {video_path}")
+
+    # ----- workflow buttons -----
+    def _start_worker(self, target) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        self.stop_flag.clear()
+        self._set_running(True)
+        def runner():
+            try:
+                target()
+            finally:
+                # ワーカーが何で終わっても UI を戻す
+                self._set_running(False)
+        self.worker_thread = threading.Thread(target=runner, daemon=True)
+        self.worker_thread.start()
+
+    def on_track_and_calib(self) -> None:
+        def _worker():
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                ok, msg = _ensure_backend_sanity(base_dir)
+                if not ok:
+                    self._show_error("エラー", msg)
+                    return
+
+                video = self.video_var.get().strip()
+                mouth_dir = self.mouth_dir_var.get().strip()
+                if not video:
+                    self._show_error("エラー", "動画を選択してください。")
+                    return
+                if not mouth_dir:
+                    self._autofill_mouth_dir()
+                    mouth_dir = self.mouth_dir_var.get().strip()
+
+                char = self._resolve_character_for_action()
+                if char is None:
+                    return
+
+                open_sprite = best_open_sprite_for_character(mouth_dir, char)
+                if not open_sprite:
+                    self._show_error("エラー", "mouthフォルダ（キャラ/Default 等）に open.png が見つかりません（キャリブ用）")
+                    return
+
+                out_dir = os.path.dirname(os.path.abspath(video))
+                track_npz = os.path.join(out_dir, "mouth_track.npz")
+                calib_npz = os.path.join(out_dir, "mouth_track_calibrated.npz")
+
+                save_session({
+                    "video": video,
+                    "source_video": video,
+                    "mouth_dir": mouth_dir,
+                    "coverage": float(self.coverage_var.get()),
+                    "pad": float(self.pad_var.get()),
+                    "audio_device": int(self.audio_device_var.get()),
+                })
+
+                self.log("\n=== [1/2] 解析（自動修復つき・最高品質） ===")
+                cmd = [
+                    sys.executable, os.path.join(base_dir, "auto_mouth_track_v2.py"),
+                    "--video", video,
+                    "--out", track_npz,
+                    "--pad", f"{float(self.pad_var.get()):.2f}",
+                    "--stride", "1",
+                    "--det-scale", "1.0",
+                    "--min-conf", "0.5",
+                    "--early-stop",
+                    "--max-tries", "4",
+                ]
+                # Apply smoothing preset from GUI (Auto = pass nothing)
+                _cutoff = SMOOTHING_PRESETS.get(self.smoothing_menu_var.get())
+                if _cutoff is not None:
+                    cmd += ["--smooth-cutoff", str(_cutoff)]
+                save_session({"smoothing": self.smoothing_menu_var.get()})
+
+                self.log("[cmd] " + " ".join(cmd))
+                rc = self._run_cmd_stream(cmd, cwd=base_dir)
+                if rc != 0 or (not os.path.isfile(track_npz)):
+                    self._show_error("失敗", f"解析に失敗しました (rc={rc})")
+                    return
+
+                self.log("\n=== [2/2] キャリブレーション（画面を閉じると完了） ===")
+                cmd = [
+                    sys.executable, os.path.join(base_dir, "calibrate_mouth_track.py"),
+                    "--video", video,
+                    "--track", track_npz,
+                    "--sprite", open_sprite,
+                    "--out", calib_npz,
+                ]
+                self.log("[cmd] " + " ".join(cmd))
+                rc = self._run_cmd_stream(cmd, cwd=base_dir)
+                if rc != 0 or (not os.path.isfile(calib_npz)):
+                    self._show_error("失敗", f"キャリブに失敗しました (rc={rc})")
+                    return
+
+                save_session({
+                    "track": track_npz,
+                    "track_calibrated": calib_npz,
+                })
+                self.log("\n完了（次は『② 口消し動画生成』）")
+            except Exception as e:
+                self._show_error("エラー", str(e))
+            finally:
+                self._set_running(False)
+        self._start_worker(_worker)
+
+    def on_calib_only(self) -> None:
+        def _worker():
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                video = self.video_var.get().strip()
+                mouth_dir = self.mouth_dir_var.get().strip()
+                if not video:
+                    self._show_error("エラー", "動画を選択してください。")
+                    return
+                char = self._resolve_character_for_action()
+                if char is None:
+                    return
+
+                open_sprite = best_open_sprite_for_character(mouth_dir, char)
+                if not open_sprite:
+                    self._show_error("エラー", "mouthフォルダ（キャラ/Default 等）に open.png が見つかりません（キャリブ用）")
+                    return
+
+                out_dir = os.path.dirname(os.path.abspath(video))
+                track_npz = os.path.join(out_dir, "mouth_track.npz")
+                calib_npz = os.path.join(out_dir, "mouth_track_calibrated.npz")
+                if not os.path.isfile(track_npz):
+                    self._show_error("エラー", "mouth_track.npz がありません。先に『① 解析→キャリブ』を実行してください。")
+                    return
+
+                # 再キャリブ時は既存のキャリブ済みファイルがあればそれを使う（位置を維持）
+                input_track = calib_npz if os.path.isfile(calib_npz) else track_npz
+
+                self.log("\n=== キャリブレーション（やり直し） ===")
+                if input_track == calib_npz:
+                    self.log("[info] 既存のキャリブ済みトラックを使用（位置を維持）")
+                cmd = [
+                    sys.executable, os.path.join(base_dir, "calibrate_mouth_track.py"),
+                    "--video", video,
+                    "--track", input_track,
+                    "--sprite", open_sprite,
+                    "--out", calib_npz,
+                ]
+                self.log("[cmd] " + " ".join(cmd))
+                rc = self._run_cmd_stream(cmd, cwd=base_dir)
+                if rc != 0 or (not os.path.isfile(calib_npz)):
+                    self._show_error("失敗", f"キャリブに失敗しました (rc={rc})")
+                    return
+
+                save_session({"track": track_npz, "track_path": track_npz, "track_calibrated": calib_npz, "track_calibrated_path": calib_npz, "calib": calib_npz})
+                self.log("\n完了")
+            except Exception as e:
+                self._show_error("エラー", str(e))
+            finally:
+                self._set_running(False)
+        self._start_worker(_worker)
+
+    def on_erase_mouthless(self) -> None:
+        def _worker():
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                video = self.video_var.get().strip()
+                mouth_dir = self.mouth_dir_var.get().strip()
+                if not video:
+                    self._show_error("エラー", "動画を選択してください。")
+                    return
+
+                out_dir = os.path.dirname(os.path.abspath(video))
+                track_npz = os.path.join(out_dir, "mouth_track.npz")
+                calib_npz = os.path.join(out_dir, "mouth_track_calibrated.npz")
+                if not os.path.isfile(track_npz):
+                    self._show_error("エラー", "mouth_track.npz がありません。先に『① 解析→キャリブ』を実行してください。")
+                    return
+                if not os.path.isfile(calib_npz):
+                    self._show_error("エラー", "mouth_track_calibrated.npz がありません。キャリブを完了してください。")
+                    return
+
+                name = os.path.splitext(os.path.basename(video))[0]
+                mouthless_mp4 = os.path.join(out_dir, f"{name}_mouthless.mp4")
+
+                cov = float(self.coverage_var.get())
+                covs = [max(0.40, min(0.90, cov + x)) for x in (0.0, 0.10, 0.20)]
+                covs = sorted(set(round(x, 2) for x in covs))
+                cov_arg = ",".join(f"{x:.2f}" for x in covs)
+
+                self.log("\n=== 口消し動画生成（自動候補->自動選別） ===")
+                cmd = [
+                    sys.executable, os.path.join(base_dir, "auto_erase_mouth.py"),
+                    "--video", video,
+                    "--track", track_npz,
+                    "--out", mouthless_mp4,
+                    "--coverage", cov_arg,
+                    "--try-strict",
+                    "--keep-audio",
+                    "--shading", ("plane" if self.erase_shading_var.get() else "none"),
+                ]
+                self.log("[cmd] " + " ".join(cmd))
+                rc = self._run_cmd_stream(cmd, cwd=base_dir)
+                if rc != 0 or (not os.path.isfile(mouthless_mp4)):
+                    self._show_error("失敗", f"口消し動画生成に失敗しました (rc={rc})")
+                    return
+
+                # runtime背景をmouthlessに更新
+                save_session({
+                    "video": mouthless_mp4,      # runtime背景
+                    "source_video": video,       # GUI表示
+                    "mouth_dir": mouth_dir,
+                    "track": track_npz,
+                    "track_calibrated": calib_npz,
+                    "coverage": float(self.coverage_var.get()),
+                    "pad": float(self.pad_var.get()),
+                    "audio_device": int(self.audio_device_var.get()),
+                })
+
+                self.log("\nプレビューを起動します…")
+                self._open_video_preview(mouthless_mp4)
+                self.log("\n完了（次は『③ ライブ実行』）")
+            except Exception as e:
+                self._show_error("エラー", str(e))
+            finally:
+                self._set_running(False)
+        self._start_worker(_worker)
+
+    def on_preview_erase_range(self) -> None:
+        """口消しのマスク範囲（inner/ring）を元フレーム上に重ねて確認するプレビュー。
+        - 赤: 実際に消す中心マスク（feather込み）
+        - 黄: ring（陰影推定に使う外周）
+        """
+        def _worker():
+            try:
+                import cv2  # type: ignore
+                import numpy as np  # type: ignore
+            except Exception:
+                self._show_error("エラー", "OpenCV(cv2) と numpy が必要です。")
+                return
+
+            video = self.video_var.get().strip()
+            if not video:
+                self._show_error("エラー", "動画を選択してください。")
+                return
+
+            out_dir = os.path.dirname(os.path.abspath(video))
+            track_npz = os.path.join(out_dir, "mouth_track.npz")
+            if not os.path.isfile(track_npz):
+                self._show_error("エラー", "mouth_track.npz がありません。先に『① 解析→キャリブ』を実行してください。")
+                return
+
+            cap = cv2.VideoCapture(video)
+            if not cap.isOpened():
+                self._show_error("エラー", f"動画を開けません: {video}")
+                return
+
+            try:
+                vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+                if vid_w <= 0 or vid_h <= 0:
+                    self._show_error("エラー", "動画サイズが取得できませんでした。")
+                    return
+
+                # ---- load track (mouth_track.npz) ----
+                npz = np.load(track_npz, allow_pickle=False)
+                if "quad" not in npz:
+                    self._show_error("エラー", "track npz に 'quad' がありません。")
+                    return
+                quads = np.asarray(npz["quad"], dtype=np.float32)
+                if quads.ndim != 3 or quads.shape[1:] != (4, 2):
+                    self._show_error("エラー", "quad の形が不正です（(N,4,2) が必要）。")
+                    return
+                N = int(quads.shape[0])
+                valid = np.asarray(npz["valid"], dtype=bool) if "valid" in npz else np.ones((N,), dtype=bool)
+
+                # scale to current video size (if track stored original w/h)
+                src_w = int(npz["w"]) if "w" in npz else vid_w
+                src_h = int(npz["h"]) if "h" in npz else vid_h
+                sx = float(vid_w) / float(max(1, src_w))
+                sy = float(vid_h) / float(max(1, src_h))
+                quads = quads.copy()
+                quads[..., 0] *= sx
+                quads[..., 1] *= sy
+
+                # hold-fill for invalid frames (same as erase_mouth_offline.py default)
+                filled = quads.copy()
+                idxs = np.where(valid)[0]
+                if len(idxs) > 0:
+                    last = int(idxs[0])
+                    for i in range(N):
+                        if valid[i]:
+                            last = i
+                        else:
+                            filled[i] = filled[last]
+                    first = int(idxs[0])
+                    for i in range(first):
+                        filled[i] = filled[first]
+                else:
+                    self._show_error("エラー", "track が全フレーム invalid のようです。")
+                    return
+
+                n_out = min(total_frames if total_frames > 0 else N, N)
+
+                # ---- decide normalized patch size (match erase_mouth_offline.py default) ----
+                def ensure_even_ge2(n: int) -> int:
+                    n = int(n)
+                    if n < 2:
+                        return 2
+                    return n if (n % 2 == 0) else (n - 1)
+
+                qsz = filled[:n_out]
+                ws = np.linalg.norm(qsz[:, 1, :] - qsz[:, 0, :], axis=1)
+                hs = np.linalg.norm(qsz[:, 3, :] - qsz[:, 0, :], axis=1)
+                ratio = float(np.median(ws / np.maximum(1e-6, hs)))
+                p95w = float(np.percentile(ws, 95))
+                oversample = 1.2
+                norm_w = ensure_even_ge2(max(96, int(round(p95w * oversample))))
+                ratio_c = max(0.25, min(4.0, ratio))
+                norm_h = ensure_even_ge2(max(64, int(round(norm_w / ratio_c))))
+
+                # ---- build masks in normalized space from current coverage ----
+                cov = float(self.coverage_var.get())
+                cov = float(np.clip(cov, 0.0, 1.0))
+
+                # same tuning as erase_mouth_offline.py (coverage mode)
+                mask_scale_x = 0.50 + 0.18 * cov
+                mask_scale_y = 0.44 + 0.14 * cov
+                ring_px = int(round(16 + 10 * cov))
+                dilate_px = int(round(8 + 8 * cov))
+                feather_px = int(round(18 + 10 * cov))
+                top_clip_frac = float(0.84 - 0.06 * cov)
+                center_y_off = int(round(norm_h * (0.05 + 0.01 * cov)))
+
+                def make_mouth_mask(w: int, h: int, rx: int, ry: int, *, center_y_offset_px: int = 0, top_clip_frac: float = 0.82):
+                    # Filled ellipse, shifted down; clip top to protect nose/philtrum
+                    mask = np.zeros((h, w), dtype=np.uint8)
+                    cx, cy = w // 2, h // 2 + int(center_y_offset_px)
+                    rx2 = int(max(1, min(int(rx), w // 2 - 1)))
+                    ry2 = int(max(1, min(int(ry), h // 2 - 1)))
+                    cv2.ellipse(mask, (cx, cy), (rx2, ry2), 0.0, 0.0, 360.0, 255, -1)
+                    clip_y = int(round(h * (1.0 - float(top_clip_frac))))
+                    clip_y = int(np.clip(clip_y, 0, h))
+                    if clip_y > 0:
+                        mask[:clip_y, :] = 0
+                    return mask
+
+                def feather_mask(mask_u8: np.ndarray, dilate_px: int, feather_px: int) -> np.ndarray:
+                    m = mask_u8.copy()
+                    if dilate_px > 0:
+                        k = 2 * int(dilate_px) + 1
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                        m = cv2.dilate(m, kernel, iterations=1)
+                    if feather_px > 0:
+                        k = 2 * int(feather_px) + 1
+                        m = cv2.GaussianBlur(m, (k, k), sigmaX=0)
+                    return (m.astype(np.float32) / 255.0).clip(0.0, 1.0)
+
+                rx = int((norm_w * mask_scale_x) * 0.5)
+                ry = int((norm_h * mask_scale_y) * 0.5)
+                inner_u8 = make_mouth_mask(norm_w, norm_h, rx=rx, ry=ry, center_y_offset_px=center_y_off, top_clip_frac=top_clip_frac)
+                outer_u8 = make_mouth_mask(norm_w, norm_h, rx=rx + ring_px, ry=ry + ring_px, center_y_offset_px=center_y_off, top_clip_frac=top_clip_frac)
+                ring_u8 = cv2.subtract(outer_u8, inner_u8)
+
+                inner_f = feather_mask(inner_u8, dilate_px=dilate_px, feather_px=feather_px)
+                ring_f = (ring_u8.astype(np.float32) / 255.0).clip(0.0, 1.0)
+
+                # ---- interactive preview ----
+                win = "erase range preview (q/ESC=close, space=play/pause, a/d=step, [ ]=±10)"
+                paused = True
+                idx = 0
+
+                src_pts = np.array(
+                    [[0, 0], [norm_w - 1, 0], [norm_w - 1, norm_h - 1], [0, norm_h - 1]],
+                    dtype=np.float32,
+                )
+
+                # colors (BGR)
+                red = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
+                red[:, :, 2] = 255
+                yellow = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
+                yellow[:, :, 1] = 255
+                yellow[:, :, 2] = 255
+
+                while True:
+                    if self.stop_flag.is_set():
+                        break
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
+
+                    q = filled[idx].astype(np.float32).reshape(4, 2)
+
+                    # warp masks into full-frame space
+                    M = cv2.getPerspectiveTransform(src_pts, q)
+                    m_inner = cv2.warpPerspective(inner_f, M, (vid_w, vid_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    m_ring = cv2.warpPerspective(ring_f, M, (vid_w, vid_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+                    out = frame.copy()
+
+                    # overlay: inner (red), ring (yellow)
+                    a_inner = 0.45
+                    a_ring = 0.25
+                    out = (out.astype(np.float32) * (1.0 - a_inner * m_inner[..., None]) + red.astype(np.float32) * (a_inner * m_inner[..., None])).astype(np.uint8)
+                    out = (out.astype(np.float32) * (1.0 - a_ring * m_ring[..., None]) + yellow.astype(np.float32) * (a_ring * m_ring[..., None])).astype(np.uint8)
+
+                    # quad outline
+                    pts = q.reshape(-1, 1, 2).astype(np.int32)
+                    cv2.polylines(out, [pts], True, (0, 255, 0), 1, cv2.LINE_AA)
+
+                    # info text
+                    info = f"frame {idx+1}/{n_out}  cov={cov:.2f}  (red=erase, yellow=ring)"
+                    cv2.putText(out, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(out, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                    if not bool(valid[idx]):
+                        cv2.putText(out, "INVALID (filled)", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+                    cv2.imshow(win, out)
+
+                    delay = max(1, int(round(1000.0 / max(1.0, fps)))) if not paused else 15
+                    k = cv2.waitKey(delay)
+                    k8 = k & 0xFF
+
+                    if k8 in (ord("q"), 27):
+                        break
+                    if k8 == ord(" "):
+                        paused = not paused
+                        continue
+                    if k8 == ord("a"):
+                        idx = max(0, idx - 1)
+                        paused = True
+                        continue
+                    if k8 == ord("d"):
+                        idx = min(n_out - 1, idx + 1)
+                        paused = True
+                        continue
+                    if k8 == ord("["):
+                        idx = max(0, idx - 10)
+                        paused = True
+                        continue
+                    if k8 == ord("]"):
+                        idx = min(n_out - 1, idx + 10)
+                        paused = True
+                        continue
+
+                    if not paused:
+                        idx += 1
+                        if idx >= n_out:
+                            break
+
+                cv2.destroyWindow(win)
+
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                try:
+                    import cv2  # type: ignore
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+
+        # プレビューは外部プロセスではないが、UIが固まらないようワーカで回す
+        self._start_worker(_worker)
+
+    def on_live_run(self) -> None:
+        def _worker():
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                sess = load_session()
+
+                # 背景は session["video"]（mouthlessが入ってる想定）を優先
+                loop_video = sess.get("video") or self.video_var.get().strip()
+                if not loop_video or (not os.path.isfile(loop_video)):
+                    self._show_error("エラー", "背景動画が見つかりません（先に口消し動画生成を推奨）")
+                    return
+
+                video_src = self.video_var.get().strip()
+                if not video_src:
+                    self._show_error("エラー", "元動画が未選択です")
+                    return
+                out_dir = os.path.dirname(os.path.abspath(video_src))
+                track_npz = os.path.join(out_dir, "mouth_track.npz")
+                calib_npz = os.path.join(out_dir, "mouth_track_calibrated.npz")
+
+                mouth_root = self.mouth_dir_var.get().strip()
+                if not mouth_root:
+                    self._show_error("エラー", "mouthフォルダを選択してください。")
+                    return
+
+                char = self._resolve_character_for_action()
+                if char is None:
+                    return
+                mouth_dir = resolve_character_dir(mouth_root, char)
+
+                device_idx = int(self.audio_device_var.get())
+                save_session({
+                    "audio_device": device_idx,
+                    "character": char,
+                    "emotion_preset": self.emotion_preset_var.get(),
+                    "emotion_hud": bool(self.emotion_hud_var.get()),
+                })
+
+                # Prefer emotion-auto runtime if present
+                runtime_py = os.path.join(base_dir, "loop_lipsync_runtime_patched_emotion_auto.py")
+                if not os.path.isfile(runtime_py):
+                    runtime_py = os.path.join(base_dir, "loop_lipsync_runtime_patched.py")
+
+                self.log("\n=== ライブ実行（qで終了） ===")
+                cmd = [
+                    sys.executable, runtime_py,
+                    "--no-auto-last-session",
+                    "--loop-video", loop_video,
+                    "--mouth-dir", mouth_dir,
+                    "--track", track_npz,
+                    "--track-calibrated", calib_npz,
+                    "--device", str(device_idx),
+                ]
+
+                # Disable manual emotion GUI (AUTO-only)
+                if self._runtime_supports(runtime_py, ["--no-emotion-gui"]):
+                    cmd.append("--no-emotion-gui")
+
+                # Emotion auto (if supported by runtime)
+                if self._runtime_supports(runtime_py, ["--emotion-auto"]):
+                    cmd.append("--emotion-auto")
+                    if self._runtime_supports(runtime_py, ["--emotion-preset"]):
+                        cmd += ["--emotion-preset", self._emotion_preset_key()]
+                    if self._runtime_supports(runtime_py, ["--emotion-hud", "--no-emotion-hud"]):
+                        cmd.append("--emotion-hud" if bool(self.emotion_hud_var.get()) else "--no-emotion-hud")
+                    
+                    # Match the CLI behavior you tested (hidden knobs, only if runtime supports them)
+                    if self._runtime_supports(runtime_py, ["--emotion-silence-db"]):
+                        cmd += ["--emotion-silence-db", "-65"]
+                    
+                    if self._runtime_supports(runtime_py, ["--emotion-min-conf"]):
+                        cmd += ["--emotion-min-conf", "0.12"]
+                    
+                    if self._runtime_supports(runtime_py, ["--emotion-hud-font"]):
+                        cmd += ["--emotion-hud-font", "28"]
+                    
+                    if self._runtime_supports(runtime_py, ["--emotion-hud-alpha"]):
+                        cmd += ["--emotion-hud-alpha", "0.92"]
+                else:
+                    self.log("[warn] runtime が感情オートに未対応のため、従来モードで実行します。")
+                self.log("[cmd] " + " ".join(cmd))
+                rc = self._run_cmd_stream(cmd, cwd=base_dir)
+                self.log(f"\n[live] finished rc={rc}")
+            except Exception as e:
+                self._show_error("エラー", str(e))
+            finally:
+                self._set_running(False)
+        self._start_worker(_worker)
+
+
+def main() -> None:
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
