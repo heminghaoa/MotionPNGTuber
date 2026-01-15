@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MotionPNGTuber Web Player</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            color: #fff;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            font-size: 24px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .container {
+            position: relative;
+            width: 720px;
+            height: 720px;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+
+        #base-video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        #mouth-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: #4a69bd;
+            color: #fff;
+        }
+
+        button:hover {
+            background: #6a89cc;
+            transform: translateY(-2px);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button.active {
+            background: #78e08f;
+        }
+
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 15px 25px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+            margin: 5px 0;
+        }
+
+        .status-label {
+            color: #aaa;
+        }
+
+        .status-value {
+            font-weight: bold;
+            color: #78e08f;
+        }
+
+        .volume-bar {
+            width: 200px;
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .volume-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #78e08f, #38ada9);
+            transition: width 0.05s;
+        }
+
+        .file-input {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }
+
+        .file-input label {
+            display: block;
+            margin-bottom: 8px;
+            color: #aaa;
+        }
+
+        .file-input input {
+            width: 100%;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 18px;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <h1>MotionPNGTuber Web Player</h1>
+
+    <div class="container">
+        <video id="base-video" loop muted playsinline></video>
+        <canvas id="mouth-canvas"></canvas>
+        <div class="loading" id="loading">Loading assets...</div>
+    </div>
+
+    <div class="controls">
+        <button id="btn-play" disabled>Play</button>
+        <button id="btn-mic" disabled>Start Mic</button>
+        <button id="btn-test">Test Mouth</button>
+    </div>
+
+    <div class="status">
+        <div class="status-item">
+            <span class="status-label">Current Mouth:</span>
+            <span class="status-value" id="status-mouth">closed</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Frame:</span>
+            <span class="status-value" id="status-frame">0</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Volume:</span>
+            <span class="status-value" id="status-volume">0</span>
+        </div>
+        <div class="volume-bar">
+            <div class="volume-fill" id="volume-fill"></div>
+        </div>
+    </div>
+
+    <div class="file-input">
+        <label>Load Assets Folder (select all files):</label>
+        <input type="file" id="file-input" multiple accept=".mp4,.json,.png" webkitdirectory>
+    </div>
+
+    <script>
+        class MouthPNGTuber {
+            constructor() {
+                this.video = document.getElementById('base-video');
+                this.canvas = document.getElementById('mouth-canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.loading = document.getElementById('loading');
+
+                this.mouthTrack = null;
+                this.mouthSprites = {};
+                this.currentMouth = 'closed';
+                this.isPlaying = false;
+                this.isMicActive = false;
+
+                // Audio
+                this.audioContext = null;
+                this.analyser = null;
+                this.dataArray = null;
+                this.micStream = null;
+
+                // Status elements
+                this.statusMouth = document.getElementById('status-mouth');
+                this.statusFrame = document.getElementById('status-frame');
+                this.statusVolume = document.getElementById('status-volume');
+                this.volumeFill = document.getElementById('volume-fill');
+
+                // Buttons
+                this.btnPlay = document.getElementById('btn-play');
+                this.btnMic = document.getElementById('btn-mic');
+                this.btnTest = document.getElementById('btn-test');
+
+                this.setupEventListeners();
+            }
+
+            setupEventListeners() {
+                this.btnPlay.addEventListener('click', () => this.togglePlay());
+                this.btnMic.addEventListener('click', () => this.toggleMic());
+                this.btnTest.addEventListener('click', () => this.testMouth());
+
+                document.getElementById('file-input').addEventListener('change', (e) => {
+                    this.loadFromFiles(e.target.files);
+                });
+
+                this.video.addEventListener('loadeddata', () => {
+                    this.canvas.width = this.video.videoWidth;
+                    this.canvas.height = this.video.videoHeight;
+                    this.loading.style.display = 'none';
+                    this.btnPlay.disabled = false;
+                });
+            }
+
+            async loadFromFiles(files) {
+                this.loading.style.display = 'block';
+                this.loading.textContent = 'Loading assets...';
+
+                const fileMap = {};
+                for (const file of files) {
+                    const name = file.name.toLowerCase();
+                    fileMap[name] = file;
+                }
+
+                // Load video
+                const videoFile = fileMap['mouthless.mp4'] || fileMap['base.mp4'];
+                if (videoFile) {
+                    const url = URL.createObjectURL(videoFile);
+                    this.video.src = url;
+                }
+
+                // Load mouth track
+                const trackFile = fileMap['mouth_track.json'];
+                if (trackFile) {
+                    const text = await trackFile.text();
+                    this.mouthTrack = JSON.parse(text);
+                    console.log('Loaded mouth track:', this.mouthTrack.frames?.length, 'frames');
+                }
+
+                // Load mouth sprites
+                const spriteNames = ['open', 'closed', 'half', 'e', 'u'];
+                for (const name of spriteNames) {
+                    const file = fileMap[`${name}.png`];
+                    if (file) {
+                        const img = new Image();
+                        img.src = URL.createObjectURL(file);
+                        await new Promise(resolve => img.onload = resolve);
+                        this.mouthSprites[name] = img;
+                        console.log('Loaded sprite:', name);
+                    }
+                }
+
+                // Enable mic button if we have sprites
+                if (Object.keys(this.mouthSprites).length > 0) {
+                    this.btnMic.disabled = false;
+                }
+
+                this.loading.style.display = 'none';
+            }
+
+            togglePlay() {
+                if (this.isPlaying) {
+                    this.video.pause();
+                    this.btnPlay.textContent = 'Play';
+                    this.btnPlay.classList.remove('active');
+                } else {
+                    this.video.play();
+                    this.btnPlay.textContent = 'Pause';
+                    this.btnPlay.classList.add('active');
+                    this.startRenderLoop();
+                }
+                this.isPlaying = !this.isPlaying;
+            }
+
+            async toggleMic() {
+                if (this.isMicActive) {
+                    this.stopMic();
+                } else {
+                    await this.startMic();
+                }
+            }
+
+            async startMic() {
+                try {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    this.analyser = this.audioContext.createAnalyser();
+                    this.analyser.fftSize = 256;
+                    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
+                    this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    const source = this.audioContext.createMediaStreamSource(this.micStream);
+                    source.connect(this.analyser);
+
+                    this.isMicActive = true;
+                    this.btnMic.textContent = 'Stop Mic';
+                    this.btnMic.classList.add('active');
+                    console.log('Mic started');
+                } catch (err) {
+                    console.error('Mic error:', err);
+                    alert('Failed to access microphone: ' + err.message);
+                }
+            }
+
+            stopMic() {
+                if (this.micStream) {
+                    this.micStream.getTracks().forEach(track => track.stop());
+                    this.micStream = null;
+                }
+                if (this.audioContext) {
+                    this.audioContext.close();
+                    this.audioContext = null;
+                }
+                this.isMicActive = false;
+                this.btnMic.textContent = 'Start Mic';
+                this.btnMic.classList.remove('active');
+                this.currentMouth = 'closed';
+                console.log('Mic stopped');
+            }
+
+            getVolume() {
+                if (!this.analyser || !this.dataArray) return 0;
+                this.analyser.getByteFrequencyData(this.dataArray);
+                const sum = this.dataArray.reduce((a, b) => a + b, 0);
+                return sum / this.dataArray.length;
+            }
+
+            getMouthState(volume) {
+                // Thresholds for mouth states
+                if (volume > 60) return 'open';
+                if (volume > 40) return 'half';
+                if (volume > 25) return 'e';
+                if (volume > 15) return 'u';
+                return 'closed';
+            }
+
+            testMouth() {
+                // Cycle through mouth states for testing
+                const states = ['closed', 'u', 'e', 'half', 'open'];
+                const idx = states.indexOf(this.currentMouth);
+                this.currentMouth = states[(idx + 1) % states.length];
+                this.renderFrame();
+            }
+
+            getCurrentFrame() {
+                if (!this.mouthTrack || !this.video.duration) return null;
+                const fps = this.mouthTrack.fps || 24;
+                const frameIdx = Math.floor(this.video.currentTime * fps);
+                return this.mouthTrack.frames[frameIdx % this.mouthTrack.frames.length];
+            }
+
+            renderFrame() {
+                // Clear canvas
+                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+                // Get current frame data
+                const frameData = this.getCurrentFrame();
+                if (!frameData || !frameData.valid) return;
+
+                // Get mouth sprite
+                const sprite = this.mouthSprites[this.currentMouth];
+                if (!sprite) return;
+
+                // Get quad from frame data
+                const quad = frameData.quad;
+                if (!quad || quad.length !== 4) return;
+
+                // Calculate bounding box from quad
+                const xs = quad.map(p => p[0]);
+                const ys = quad.map(p => p[1]);
+                const x = Math.min(...xs);
+                const y = Math.min(...ys);
+                const w = Math.max(...xs) - x;
+                const h = Math.max(...ys) - y;
+
+                // Draw mouth sprite
+                this.ctx.drawImage(sprite, x, y, w, h);
+
+                // Update status
+                const fps = this.mouthTrack?.fps || 24;
+                const frameIdx = Math.floor(this.video.currentTime * fps);
+                this.statusFrame.textContent = frameIdx;
+                this.statusMouth.textContent = this.currentMouth;
+            }
+
+            startRenderLoop() {
+                const loop = () => {
+                    if (!this.isPlaying) return;
+
+                    // Update mouth state from mic
+                    if (this.isMicActive) {
+                        const volume = this.getVolume();
+                        this.currentMouth = this.getMouthState(volume);
+
+                        // Update volume display
+                        this.statusVolume.textContent = Math.round(volume);
+                        this.volumeFill.style.width = `${Math.min(100, volume)}%`;
+                    }
+
+                    this.renderFrame();
+                    requestAnimationFrame(loop);
+                };
+                loop();
+            }
+        }
+
+        // Initialize
+        const tuber = new MouthPNGTuber();
+
+        // Try to load from default paths
+        (async function() {
+            try {
+                // Try loading from same directory
+                const paths = {
+                    video: 'mouthless.mp4',
+                    track: 'mouth_track.json',
+                    sprites: ['open.png', 'closed.png', 'half.png', 'e.png', 'u.png']
+                };
+
+                // Load video
+                const videoResp = await fetch(paths.video);
+                if (videoResp.ok) {
+                    tuber.video.src = paths.video;
+                }
+
+                // Load track
+                const trackResp = await fetch(paths.track);
+                if (trackResp.ok) {
+                    tuber.mouthTrack = await trackResp.json();
+                    console.log('Auto-loaded mouth track');
+                }
+
+                // Load sprites
+                for (const name of ['open', 'closed', 'half', 'e', 'u']) {
+                    try {
+                        const img = new Image();
+                        img.src = `${name}.png`;
+                        await new Promise((resolve, reject) => {
+                            img.onload = resolve;
+                            img.onerror = reject;
+                        });
+                        tuber.mouthSprites[name] = img;
+                        console.log('Auto-loaded sprite:', name);
+                    } catch (e) {
+                        // Sprite not found, continue
+                    }
+                }
+
+                if (Object.keys(tuber.mouthSprites).length > 0) {
+                    tuber.btnMic.disabled = false;
+                }
+            } catch (e) {
+                console.log('Auto-load failed, use file picker:', e);
+            }
+        })();
+    </script>
+</body>
+</html>

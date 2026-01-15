@@ -208,3 +208,16 @@ __marimo__/
 
 # Dependencies (for Mac)
 deps/
+
+# Test output and generated data
+output/
+test_output/
+*.mp4
+*.avi
+*.png
+!assets/**/*.png
+
+# Web player test assets (keep only index.html)
+web_player/*.mp4
+web_player/*.json
+web_player/*.png
