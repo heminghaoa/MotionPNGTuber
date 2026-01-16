@@ -26,6 +26,7 @@ class EraseConfig:
     blend: bool = True  # 边缘融合
     feather_px: int = 8  # 羽化像素
     top_clip_frac: float = 0.85  # 顶部裁剪比例（保护鼻子）
+    bottom_extend: float = 0.3  # 向下扩展比例（嘴张开时向下扩展）
 
 
 class MouthEraser:
@@ -124,6 +125,11 @@ class MouthEraser:
         y_min = max(0, int(quad[:, 1].min()))
         x_max = min(frame_w, int(quad[:, 0].max()))
         y_max = min(frame_h, int(quad[:, 1].max()))
+
+        # 向下扩展（嘴张开时向下扩展）
+        bbox_h = y_max - y_min
+        bottom_ext = int(bbox_h * self.erase_config.bottom_extend)
+        y_max = min(frame_h, y_max + bottom_ext)
 
         # 计算椭圆参数
         cx = (x_min + x_max) // 2

@@ -56,14 +56,14 @@ class Config:
     video_duration: int = 5  # 秒
 
     # 嘴部检测参数
-    mouth_detect_batch_mode: bool = True  # 使用视频批量检测模式（一次API调用）
+    mouth_detect_batch_mode: bool = False  # 使用视频批量检测模式（一次API调用）
     mouth_detect_batch_fps: float = 2.0  # 批量模式采样帧率 (0.1-10)
-    mouth_detect_sample_rate: int = 5  # 逐帧模式采样率: 1=每帧, 5=每5帧检测一次
-    mouth_smoothing_beta: float = 0.3  # EMA 平滑系数
+    mouth_detect_sample_rate: int = 1  # 逐帧模式采样率: 1=每帧检测
+    mouth_smoothing_beta: float = 1.0  # EMA 平滑系数 (1.0=不平滑，直接使用检测值)
 
     # 口消し参数
-    erase_pad: int = 10  # mask 膨胀像素
-    erase_inpaint_radius: int = 5  # inpaint 半径
+    erase_pad: int = 30  # mask 膨胀像素（增大以完全覆盖嘴部）
+    erase_inpaint_radius: int = 7  # inpaint 半径
     erase_blend: bool = True  # 边缘融合
 
     # 轮询配置

@@ -12,7 +12,7 @@ API 端点（新加坡）：
 """
 
 from .config import Config
-from .mouth_detector import MouthDetector
+from .mouth_detector import MouthDetector, MouthTrack
 from .mouth_eraser import MouthEraser
 from .video_generator import VideoGenerator
 from .sprite_extractor import SpriteExtractor
@@ -21,6 +21,7 @@ from .pipeline import Pipeline
 __all__ = [
     "Config",
     "MouthDetector",
+    "MouthTrack",
     "MouthEraser",
     "VideoGenerator",
     "SpriteExtractor",

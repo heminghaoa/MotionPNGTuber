@@ -104,35 +104,41 @@ class MouthDetector:
         track.save("mouth_track.json")
     """
 
-    DETECT_PROMPT = """请检测图中动漫角色的嘴部位置。
+    DETECT_PROMPT = """请精确检测图中动漫角色的嘴唇/嘴巴位置。
+
+重要说明：
+- 嘴唇位于脸部下方，鼻子下方，下巴上方
+- 不要检测眼睛、鼻子、额头或其他部位
+- 嘴唇通常是红色或粉色的
 
 要求：
-1. 输出嘴部的边界框坐标，格式为 [x1, y1, x2, y2]
-2. 坐标需要归一化到 0-1 范围（相对于图像宽高）
-3. 只输出 JSON 格式，不要其他文字
+1. 输出嘴唇区域的边界框坐标 [x1, y1, x2, y2]
+2. 坐标必须归一化到 0-1 范围（相对于图像宽高的比例）
+3. x1,y1 是左上角，x2,y2 是右下角
+4. 只输出 JSON，不要其他文字
 
 输出格式：
 {"bbox": [x1, y1, x2, y2], "confidence": 0.95}
 
-如果检测不到嘴部，输出：
-{"bbox": [0, 0, 0, 0], "confidence": 0, "valid": false}"""
+示例（嘴唇通常在 y=0.3-0.45 范围）：
+{"bbox": [0.4, 0.35, 0.6, 0.42], "confidence": 0.95}"""
 
-    VIDEO_DETECT_PROMPT = """请检测视频中每一帧动漫角色的嘴部位置。
+    VIDEO_DETECT_PROMPT = """请检测视频中动漫角色的嘴部（嘴唇）位置。
 
-要求：
-1. 对视频的每一帧，输出嘴部的边界框坐标
-2. 坐标格式为 [x1, y1, x2, y2]，归一化到 0-1 范围
-3. 输出 JSON 数组格式
+重要要求：
+1. 检测的是角色的嘴唇/嘴巴区域，不是其他部位
+2. 坐标必须是归一化的 0-1 范围（相对于视频宽高的比例）
+3. 格式：[x1, y1, x2, y2] 其中 (x1,y1) 是左上角，(x2,y2) 是右下角
+4. 所有坐标值都应该在 0.0 到 1.0 之间
 
-输出格式（每帧一个对象）：
+输出 JSON 数组，每帧一个对象：
 [
-  {"frame": 0, "bbox": [x1, y1, x2, y2]},
-  {"frame": 1, "bbox": [x1, y1, x2, y2]},
+  {"frame": 0, "bbox": [0.4, 0.35, 0.6, 0.45]},
+  {"frame": 1, "bbox": [0.4, 0.35, 0.6, 0.45]},
   ...
 ]
 
-如果某帧检测不到嘴部，该帧输出：
-{"frame": N, "bbox": [0, 0, 0, 0], "valid": false}"""
+注意：确保 bbox 坐标是 0-1 范围的归一化值！"""
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
@@ -281,6 +287,9 @@ class MouthDetector:
 
         try:
             data_list = json.loads(array_match.group())
+            print(f"[MouthDetector] 解析到 {len(data_list)} 个数据项")
+            if data_list:
+                print(f"[MouthDetector] 第一个数据项: {data_list[0]}")
             results = []
 
             for item in data_list:
@@ -401,9 +410,11 @@ class MouthDetector:
 
         # 如果文件过大，尝试压缩
         temp_video_path = None
+        compressed_scale = 1.0  # 压缩比例
         if file_size > max_size:
             print(f"[MouthDetector] 视频文件 {file_size/1024/1024:.1f}MB，尝试压缩...")
-            temp_video_path = self._compress_video(video_path, max_size)
+            compressed_scale = 0.5
+            temp_video_path = self._compress_video(video_path, max_size, scale=compressed_scale)
             if temp_video_path:
                 video_path = temp_video_path
                 file_size = video_path.stat().st_size
@@ -454,8 +465,14 @@ class MouthDetector:
 
             content = response.choices[0].message.content or ""
             print(f"[MouthDetector] API 响应长度: {len(content)}")
+            print(f"[MouthDetector] API 响应内容: {content[:500]}...")
 
-            bboxes = self._parse_video_response(content, width, height)
+            # 注意：VL 模型可能按原始尺寸返回坐标，而不是压缩后的尺寸
+            # 尝试使用原始尺寸解析
+            vl_width = width
+            vl_height = height
+            print(f"[MouthDetector] 使用尺寸: {vl_width}x{vl_height} (原始尺寸)")
+            bboxes = self._parse_video_response(content, vl_width, vl_height)
             print(f"[MouthDetector] 检测到 {len(bboxes)} 个帧的嘴部位置")
 
         except Exception as e:
@@ -527,18 +544,22 @@ class MouthDetector:
         video_path: str | Path,
         sample_rate: int | None = None,
         progress_callback: callable | None = None,
+        max_workers: int = 5,
     ) -> "MouthTrack":
         """
-        检测视频中所有帧的嘴部位置
+        检测视频中所有帧的嘴部位置（并发 API 调用）
 
         Args:
             video_path: 视频路径
-            sample_rate: 采样率（1=每帧, 2=隔帧）
+            sample_rate: 采样率（1=每帧, 5=每5帧）
             progress_callback: 进度回调 fn(current, total)
+            max_workers: 并发线程数
 
         Returns:
             MouthTrack
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         video_path = Path(video_path)
         sample_rate = sample_rate or self.config.mouth_detect_sample_rate
 
@@ -551,12 +572,9 @@ class MouthDetector:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        frames: list[dict] = []
+        # 1. 收集需要检测的帧
+        sample_frames: list[tuple[int, np.ndarray]] = []
         frame_idx = 0
-        last_bbox: MouthBBox | None = None
-
-        # 重置平滑状态
-        self._last_bbox = None
 
         try:
             while True:
@@ -565,27 +583,57 @@ class MouthDetector:
                     break
 
                 if frame_idx % sample_rate == 0:
-                    bbox = self.detect_frame(frame, smooth=True)
-                    last_bbox = bbox
-                else:
-                    # 非采样帧使用上一帧结果
-                    bbox = last_bbox or MouthBBox.invalid()
-
-                frames.append(
-                    {
-                        "frame": frame_idx,
-                        "quad": bbox.to_quad(width, height).tolist(),
-                        "valid": bbox.valid,
-                        "confidence": bbox.confidence,
-                    }
-                )
-
-                if progress_callback:
-                    progress_callback(frame_idx + 1, total_frames)
+                    sample_frames.append((frame_idx, frame.copy()))
 
                 frame_idx += 1
         finally:
             cap.release()
+
+        print(f"[MouthDetector] 并发检测 {len(sample_frames)} 帧，线程数={max_workers}")
+
+        # 2. 并发检测
+        results: dict[int, MouthBBox] = {}
+        completed = 0
+
+        def detect_single(args):
+            idx, img = args
+            return idx, self.detect_frame(img, smooth=False)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(detect_single, sf): sf[0] for sf in sample_frames}
+
+            for future in as_completed(futures):
+                idx, bbox = future.result()
+                results[idx] = bbox
+                completed += 1
+
+                if progress_callback:
+                    progress_callback(completed, len(sample_frames))
+
+        # 3. 按顺序整理结果，应用平滑
+        self._last_bbox = None
+        sorted_indices = sorted(results.keys())
+        smoothed_results: dict[int, MouthBBox] = {}
+
+        for idx in sorted_indices:
+            bbox = self._smooth_bbox(results[idx])
+            smoothed_results[idx] = bbox
+
+        # 4. 插值到所有帧
+        frames: list[dict] = []
+        last_bbox: MouthBBox | None = None
+
+        for i in range(total_frames):
+            if i in smoothed_results:
+                last_bbox = smoothed_results[i]
+
+            bbox = last_bbox or MouthBBox.invalid()
+            frames.append({
+                "frame": i,
+                "quad": bbox.to_quad(width, height).tolist(),
+                "valid": bbox.valid,
+                "confidence": bbox.confidence,
+            })
 
         return MouthTrack(
             fps=fps,

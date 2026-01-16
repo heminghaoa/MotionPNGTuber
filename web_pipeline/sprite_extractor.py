@@ -30,6 +30,7 @@ class MouthFrameInfo:
     height: float
     aspect_ratio: float  # width / height
     valid: bool
+    openness: float = 0.0  # 嘴部开合程度 (0-1, 基于图像分析)
 
 
 @dataclass
@@ -83,12 +84,65 @@ class SpriteExtractor:
         h = float(np.linalg.norm(quad[3] - quad[0]))
         return w, h
 
+    def _analyze_openness(self, frame: np.ndarray, quad: np.ndarray) -> float:
+        """
+        分析嘴部开合程度 (基于图像分析)
+
+        原理：张开的嘴内部较暗（口腔），闭合的嘴主要是皮肤和嘴唇色
+        返回 0-1 的开合程度
+        """
+        quad = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+        x1, y1 = int(quad[0][0]), int(quad[0][1])
+        x2, y2 = int(quad[2][0]), int(quad[2][1])
+
+        # 边界检查
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        # 裁剪嘴部区域
+        roi = frame[y1:y2, x1:x2]
+
+        # 转换到 HSV 分析暗色区域
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # 暗色像素 (V < 80) 通常是口腔内部
+        dark_mask = hsv[:, :, 2] < 80
+        dark_ratio = np.sum(dark_mask) / dark_mask.size
+
+        # 红色/深色像素 (嘴唇打开时露出的口腔)
+        # H 在 0-10 或 170-180 范围，S > 50，V < 150
+        h_channel = hsv[:, :, 0]
+        s_channel = hsv[:, :, 1]
+        v_channel = hsv[:, :, 2]
+
+        red_dark_mask = (
+            ((h_channel < 15) | (h_channel > 165)) &
+            (s_channel > 30) &
+            (v_channel < 150)
+        )
+        red_dark_ratio = np.sum(red_dark_mask) / red_dark_mask.size
+
+        # 综合评分
+        openness = dark_ratio * 0.5 + red_dark_ratio * 0.5
+        return min(1.0, openness * 3)  # 放大系数
+
     def _analyze_frames(
         self,
         track: MouthTrack,
+        video_path: str | Path | None = None,
     ) -> List[MouthFrameInfo]:
         """分析所有帧的嘴部信息"""
         frames = []
+
+        # 如果提供视频路径，分析图像内容
+        cap = None
+        if video_path:
+            cap = cv2.VideoCapture(str(video_path))
+
         for i, f in enumerate(track.frames):
             quad = np.array(f["quad"], dtype=np.float32)
             valid = f.get("valid", True)
@@ -101,11 +155,20 @@ class SpriteExtractor:
                     height=0,
                     aspect_ratio=1,
                     valid=False,
+                    openness=0,
                 ))
                 continue
 
             w, h = self._quad_size(quad)
             aspect = w / max(h, 1e-6)
+
+            # 分析开合程度
+            openness = 0.0
+            if cap is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = cap.read()
+                if ret:
+                    openness = self._analyze_openness(frame, quad)
 
             frames.append(MouthFrameInfo(
                 frame_idx=i,
@@ -114,7 +177,11 @@ class SpriteExtractor:
                 height=h,
                 aspect_ratio=aspect,
                 valid=True,
+                openness=openness,
             ))
+
+        if cap is not None:
+            cap.release()
 
         return frames
 
@@ -125,21 +192,25 @@ class SpriteExtractor:
         """
         选择 5 种嘴型
 
-        选择标准：
-        - open: 高度最大
-        - closed: 高度最小
-        - half: 高度接近中位数
-        - e: 宽高比最大（横长）
-        - u: 宽度最小且高度中等（嘟嘴）
+        选择标准（基于图像分析的开合程度）：
+        - open: 开合程度最大
+        - closed: 开合程度最小
+        - half: 开合程度接近中位数
+        - e: 宽高比最大且有一定开度（横长）
+        - u: 开度较小且分散（嘟嘴）
         """
         valid_frames = [f for f in frames if f.valid]
 
         if len(valid_frames) < 5:
             raise ValueError(f"有效帧不足 5 个 ({len(valid_frames)})")
 
+        openness = np.array([f.openness for f in valid_frames])
         heights = np.array([f.height for f in valid_frames])
         widths = np.array([f.width for f in valid_frames])
         aspects = np.array([f.aspect_ratio for f in valid_frames])
+
+        # 打印调试信息
+        print(f"[SpriteExtractor] 开合程度范围: {openness.min():.3f} - {openness.max():.3f}")
 
         used = set()
 
@@ -157,23 +228,23 @@ class SpriteExtractor:
 
             return valid_frames[order[0]].frame_idx
 
-        # 1. open: 高度最大
-        open_idx = pick(heights, maximize=True)
+        # 1. open: 开合程度最大
+        open_idx = pick(openness, maximize=True)
 
-        # 2. closed: 高度最小
-        closed_idx = pick(heights, maximize=False)
+        # 2. closed: 开合程度最小
+        closed_idx = pick(openness, maximize=False)
 
-        # 3. half: 高度接近中位数
-        median_h = np.median(heights)
-        half_scores = -np.abs(heights - median_h)
+        # 3. half: 开合程度接近中位数
+        median_open = np.median(openness)
+        half_scores = -np.abs(openness - median_open)
         half_idx = pick(half_scores, maximize=True)
 
-        # 4. e: 宽高比最大（横长）
-        e_idx = pick(aspects, maximize=True)
+        # 4. e: 宽高比大 + 有一定开度（横长张嘴）
+        e_scores = aspects + openness * 0.5
+        e_idx = pick(e_scores, maximize=True)
 
-        # 5. u: 宽度小 + 高度中等
-        h_dist = np.abs(heights - median_h)
-        u_scores = -widths - 0.5 * h_dist
+        # 5. u: 开度小 + 分布均匀（嘟嘴）
+        u_scores = -openness - aspects * 0.3
         u_idx = pick(u_scores, maximize=True)
 
         return SpriteSelection(
@@ -291,8 +362,8 @@ class SpriteExtractor:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 分析帧
-        frames = self._analyze_frames(track)
+        # 分析帧（包括图像内容分析）
+        frames = self._analyze_frames(track, video_path)
 
         # 选择 5 种嘴型
         selection = self._select_5_types(frames)
