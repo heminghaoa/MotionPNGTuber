@@ -89,7 +89,7 @@ class Pipeline:
         self.video_generator = VideoGenerator(self.config)
         self.mouth_detector = MouthDetector(self.config)
         self.mouth_eraser = MouthEraser(self.config)
-        self.sprite_extractor = SpriteExtractor()
+        self.sprite_extractor = SpriteExtractor(config=self.config)
 
         # 进度回调
         self._progress_callback: Callable[[PipelineProgress], None] | None = None

@@ -512,7 +512,7 @@ class MouthDetector:
         width: int,
         height: int,
     ) -> list[dict]:
-        """将采样帧的检测结果插值到所有帧"""
+        """将采样帧的检测结果线性插值到所有帧"""
         if not bboxes:
             # 没有检测结果，返回全无效
             return [
@@ -525,16 +525,44 @@ class MouthDetector:
 
         frames = []
         for frame_idx in range(total_frames):
-            # 找到最近的采样帧
-            sample_idx = int(frame_idx / sample_interval)
-            sample_idx = min(sample_idx, len(bboxes) - 1)
+            # 计算在采样帧序列中的浮点位置
+            sample_pos = frame_idx / sample_interval
 
-            bbox = bboxes[sample_idx]
+            # 找到前后两个采样帧
+            idx_before = int(sample_pos)
+            idx_after = min(idx_before + 1, len(bboxes) - 1)
+            idx_before = min(idx_before, len(bboxes) - 1)
+
+            bbox_before = bboxes[idx_before]
+            bbox_after = bboxes[idx_after]
+
+            # 如果前后帧相同或有一个无效，直接使用
+            if idx_before == idx_after or not bbox_before.valid or not bbox_after.valid:
+                bbox = bbox_before if bbox_before.valid else bbox_after
+                frames.append({
+                    "frame": frame_idx,
+                    "quad": bbox.to_quad(width, height).tolist(),
+                    "valid": bbox.valid,
+                    "confidence": bbox.confidence,
+                })
+                continue
+
+            # 线性插值
+            t = sample_pos - idx_before  # 0-1 之间的插值因子
+            interpolated_bbox = MouthBBox(
+                x1=bbox_before.x1 * (1 - t) + bbox_after.x1 * t,
+                y1=bbox_before.y1 * (1 - t) + bbox_after.y1 * t,
+                x2=bbox_before.x2 * (1 - t) + bbox_after.x2 * t,
+                y2=bbox_before.y2 * (1 - t) + bbox_after.y2 * t,
+                confidence=(bbox_before.confidence + bbox_after.confidence) / 2,
+                valid=True,
+            )
+
             frames.append({
                 "frame": frame_idx,
-                "quad": bbox.to_quad(width, height).tolist(),
-                "valid": bbox.valid,
-                "confidence": bbox.confidence,
+                "quad": interpolated_bbox.to_quad(width, height).tolist(),
+                "valid": True,
+                "confidence": interpolated_bbox.confidence,
             })
 
         return frames
@@ -544,7 +572,7 @@ class MouthDetector:
         video_path: str | Path,
         sample_rate: int | None = None,
         progress_callback: callable | None = None,
-        max_workers: int = 5,
+        max_workers: int = 3,
     ) -> "MouthTrack":
         """
         检测视频中所有帧的嘴部位置（并发 API 调用）

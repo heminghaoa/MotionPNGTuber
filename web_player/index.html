@@ -30,7 +30,7 @@
 
         .container {
             position: relative;
-            width: 720px;
+            width: 405px;
             height: 720px;
             background: #000;
             border-radius: 12px;
@@ -41,7 +41,7 @@
         #base-video {
             width: 100%;
             height: 100%;
-            object-fit: contain;
+            object-fit: fill;
         }
 
         #mouth-canvas {
@@ -147,6 +147,25 @@
             width: 100%;
         }
 
+        .audio-upload {
+            margin-top: 15px;
+            padding: 15px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .audio-upload label {
+            color: #aaa;
+        }
+
+        .audio-upload input[type="file"] {
+            max-width: 200px;
+        }
+
         .loading {
             position: absolute;
             top: 50%;
@@ -172,6 +191,13 @@
         <button id="btn-test">Test Mouth</button>
     </div>
 
+    <div class="audio-upload">
+        <label for="audio-input">Upload Audio to Test:</label>
+        <input type="file" id="audio-input" accept="audio/*">
+        <button id="btn-play-audio" disabled>Play Audio</button>
+        <button id="btn-stop-audio" disabled>Stop</button>
+    </div>
+
     <div class="status">
         <div class="status-item">
             <span class="status-label">Current Mouth:</span>
@@ -187,6 +213,31 @@
         </div>
         <div class="volume-bar">
             <div class="volume-fill" id="volume-fill"></div>
+        </div>
+    </div>
+
+    <div class="status" style="margin-top: 10px;">
+        <div class="status-item">
+            <span class="status-label">Y 校准偏移:</span>
+            <span class="status-value" id="calib-y-value">0%</span>
+        </div>
+        <input type="range" id="calib-y-slider" min="-30" max="30" value="0" style="width: 200px;">
+        <div style="font-size: 12px; color: #888; margin-top: 5px;">
+            负值=向上移动，正值=向下移动
+        </div>
+        <div class="status-item" style="margin-top: 10px;">
+            <span class="status-label">平滑程度:</span>
+            <span class="status-value" id="smooth-value">18%</span>
+        </div>
+        <input type="range" id="smooth-slider" min="5" max="50" value="18" style="width: 200px;">
+        <div style="font-size: 12px; color: #888; margin-top: 5px;">
+            越小=越平滑(延迟大)，越大=跟随快(可能抖动)
+        </div>
+        <div class="status-item" style="margin-top: 10px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="lock-position" style="width: 18px; height: 18px;">
+                <span>锁定嘴部位置（不跟随角色动作）</span>
+            </label>
         </div>
     </div>
 
@@ -215,6 +266,55 @@
                 this.dataArray = null;
                 this.micStream = null;
 
+                // ============ 音频状态管理（仿原版） ============
+                // 平滑参数
+                this.audioHz = 60;  // 目标更新频率
+                this.cutoffHz = 8.0;  // 低通滤波截止频率
+                this.beta = this._onePoleCoef(this.cutoffHz, this.audioHz);
+
+                // 噪声和峰值追踪
+                this.noise = 0.0001;
+                this.peak = 0.001;
+                this.peakDecay = 0.995;
+                this.silenceGate = 0.0005;  // 降低静音门限，让更多信号通过
+
+                // 平滑队列和包络
+                this.rmsQueue = [];  // 3帧滑动平均
+                this.envLp = 0;  // 低通滤波后的包络
+                this.envHist = [];  // 历史记录用于自适应阈值
+                this.centHist = [];  // 频谱质心历史
+
+                // 自适应阈值（初始值较低，会根据实际音量自动调整）
+                this.TALK_TH = 0.02;
+                this.HALF_TH = 0.08;
+                this.OPEN_TH = 0.20;
+                this.U_TH = 0.16;
+                this.E_TH = 0.20;
+
+                // 状态机
+                this.currentOpenShape = 'open';  // open/e/u
+                this.lastVowelChangeTime = -999;
+                this.minVowelInterval = 0.12;  // 最小元音切换间隔（秒）
+                this.peakMargin = 0.02;
+                this.ePrev2 = 0;
+                this.ePrev1 = 0;
+                this.audioStartTime = 0;
+
+                // 渲染状态
+                this._lastValidQuad = null;  // Hold 策略：记录上一个有效的 quad
+                this._smoothedQuad = null;   // 平滑后的 quad
+                this._quadSmoothingAlpha = 0.18;  // 平滑系数（0-1，越小越平滑）- 平衡抖动和跟随速度
+
+                // 位置校准（修正 VL 检测偏差）
+                // 根据实际测试调整，默认不偏移
+                this._calibrationOffsetY = 0;  // Y轴偏移（负=向上，正=向下）
+                this._calibrationOffsetX = 0;  // X轴偏移
+                this._calibrationScale = 1.0;  // 缩放
+
+                // 位置锁定模式（使用固定位置而非每帧跟踪）
+                this._lockPosition = false;
+                this._lockedQuad = null;  // 锁定时使用的固定 quad
+
                 // Status elements
                 this.statusMouth = document.getElementById('status-mouth');
                 this.statusFrame = document.getElementById('status-frame');
@@ -225,6 +325,14 @@
                 this.btnPlay = document.getElementById('btn-play');
                 this.btnMic = document.getElementById('btn-mic');
                 this.btnTest = document.getElementById('btn-test');
+                this.btnPlayAudio = document.getElementById('btn-play-audio');
+                this.btnStopAudio = document.getElementById('btn-stop-audio');
+                this.audioInput = document.getElementById('audio-input');
+
+                // Audio playback
+                this.audioElement = null;
+                this.audioSource = null;
+                this.isAudioPlaying = false;
 
                 this.setupEventListeners();
             }
@@ -233,17 +341,77 @@
                 this.btnPlay.addEventListener('click', () => this.togglePlay());
                 this.btnMic.addEventListener('click', () => this.toggleMic());
                 this.btnTest.addEventListener('click', () => this.testMouth());
+                this.btnPlayAudio.addEventListener('click', () => this.playAudioFile());
+                this.btnStopAudio.addEventListener('click', () => this.stopAudioFile());
+
+                this.audioInput.addEventListener('change', async (e) => {
+                    if (e.target.files.length > 0) {
+                        await this.loadAudioFile(e.target.files[0]);
+                    }
+                });
 
                 document.getElementById('file-input').addEventListener('change', (e) => {
                     this.loadFromFiles(e.target.files);
                 });
 
                 this.video.addEventListener('loadeddata', () => {
-                    this.canvas.width = this.video.videoWidth;
-                    this.canvas.height = this.video.videoHeight;
+                    this.updateCanvasSize();
                     this.loading.style.display = 'none';
                     this.btnPlay.disabled = false;
                 });
+
+                // Update canvas size when window resizes
+                window.addEventListener('resize', () => this.updateCanvasSize());
+
+                // Calibration slider
+                const calibSlider = document.getElementById('calib-y-slider');
+                const calibValue = document.getElementById('calib-y-value');
+                calibSlider.addEventListener('input', (e) => {
+                    const val = parseInt(e.target.value);
+                    this._calibrationOffsetY = val / 100;  // Convert to ratio
+                    calibValue.textContent = `${val}%`;
+                    console.log(`[Calibration] Y offset set to ${val}%`);
+                });
+
+                // Smoothing slider
+                const smoothSlider = document.getElementById('smooth-slider');
+                const smoothValue = document.getElementById('smooth-value');
+                smoothSlider.addEventListener('input', (e) => {
+                    const val = parseInt(e.target.value);
+                    this._quadSmoothingAlpha = val / 100;
+                    smoothValue.textContent = `${val}%`;
+                    console.log(`[Smoothing] Alpha set to ${val}%`);
+                });
+
+                // Lock position checkbox
+                const lockCheckbox = document.getElementById('lock-position');
+                lockCheckbox.addEventListener('change', (e) => {
+                    this._lockPosition = e.target.checked;
+                    if (this._lockPosition) {
+                        // 锁定时，使用当前的平滑后位置
+                        if (this._smoothedQuad) {
+                            this._lockedQuad = this._smoothedQuad.map(p => [...p]);
+                            console.log('[Position] Locked at current position');
+                        } else if (this._lastValidQuad) {
+                            this._lockedQuad = this._lastValidQuad.map(p => [...p]);
+                            console.log('[Position] Locked at last valid position');
+                        }
+                    } else {
+                        this._lockedQuad = null;
+                        console.log('[Position] Unlocked, following character movement');
+                    }
+                });
+            }
+
+            updateCanvasSize() {
+                // Set canvas internal size to match video's natural size
+                const videoW = this.video.videoWidth || 1080;
+                const videoH = this.video.videoHeight || 1920;
+
+                this.canvas.width = videoW;
+                this.canvas.height = videoH;
+
+                console.log(`Canvas initialized: ${videoW}x${videoH}`);
             }
 
             async loadFromFiles(files) {
@@ -297,13 +465,14 @@
                     this.video.pause();
                     this.btnPlay.textContent = 'Play';
                     this.btnPlay.classList.remove('active');
+                    this.isPlaying = false;
                 } else {
                     this.video.play();
                     this.btnPlay.textContent = 'Pause';
                     this.btnPlay.classList.add('active');
+                    this.isPlaying = true;  // 先设为 true，再启动循环
                     this.startRenderLoop();
                 }
-                this.isPlaying = !this.isPlaying;
             }
 
             async toggleMic() {
@@ -326,6 +495,7 @@
                     source.connect(this.analyser);
 
                     this.isMicActive = true;
+                    this._resetAudioState();  // 重置音频状态
                     this.btnMic.textContent = 'Stop Mic';
                     this.btnMic.classList.add('active');
                     console.log('Mic started');
@@ -340,7 +510,7 @@
                     this.micStream.getTracks().forEach(track => track.stop());
                     this.micStream = null;
                 }
-                if (this.audioContext) {
+                if (this.audioContext && !this.isAudioPlaying) {
                     this.audioContext.close();
                     this.audioContext = null;
                 }
@@ -351,20 +521,344 @@
                 console.log('Mic stopped');
             }
 
-            getVolume() {
-                if (!this.analyser || !this.dataArray) return 0;
-                this.analyser.getByteFrequencyData(this.dataArray);
-                const sum = this.dataArray.reduce((a, b) => a + b, 0);
-                return sum / this.dataArray.length;
+            async loadAudioFile(file) {
+                // Stop any current playback
+                this.stopAudioFile();
+
+                // Read file as ArrayBuffer and decode
+                const arrayBuffer = await file.arrayBuffer();
+                // Store a copy for re-decoding later
+                this._audioArrayBuffer = arrayBuffer.slice(0);
+
+                // Create fresh audio context
+                if (this.audioContext) {
+                    try { this.audioContext.close(); } catch (e) {}
+                }
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                this.analyser = this.audioContext.createAnalyser();
+                this.analyser.fftSize = 256;
+                this.analyser.smoothingTimeConstant = 0.3;
+                this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
+                // Decode audio data
+                try {
+                    this.audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+                    this.btnPlayAudio.disabled = false;
+                    console.log('Audio decoded:', file.name, 'duration:', this.audioBuffer.duration.toFixed(1) + 's');
+                } catch (e) {
+                    console.error('Failed to decode audio:', e);
+                    alert('无法解码音频文件');
+                }
             }
 
-            getMouthState(volume) {
-                // Thresholds for mouth states
-                if (volume > 60) return 'open';
-                if (volume > 40) return 'half';
-                if (volume > 25) return 'e';
-                if (volume > 15) return 'u';
-                return 'closed';
+            async playAudioFile() {
+                if (!this.audioBuffer) {
+                    console.log('No audio buffer');
+                    return;
+                }
+
+                // Stop mic if active (AFTER setting isAudioPlaying to preserve audioContext)
+                this.isAudioPlaying = true;
+                if (this.isMicActive) {
+                    this.stopMic();
+                }
+
+                // Stop any existing source
+                if (this.audioSourceNode) {
+                    try {
+                        this.audioSourceNode.stop();
+                    } catch (e) {}
+                    this.audioSourceNode = null;
+                }
+
+                // Recreate audio context and analyser if needed (Safari fix)
+                if (!this.audioContext || this.audioContext.state === 'closed') {
+                    console.log('Creating new AudioContext for playback');
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    this.analyser = this.audioContext.createAnalyser();
+                    this.analyser.fftSize = 256;
+                    this.analyser.smoothingTimeConstant = 0.3;
+                    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
+                    // Re-decode the audio (need to store original array buffer)
+                    if (this._audioArrayBuffer) {
+                        this.audioBuffer = await this.audioContext.decodeAudioData(this._audioArrayBuffer.slice(0));
+                    }
+                }
+
+                // Resume audio context if suspended
+                if (this.audioContext.state === 'suspended') {
+                    console.log('Resuming suspended AudioContext');
+                    await this.audioContext.resume();
+                }
+                console.log('AudioContext state:', this.audioContext.state);
+
+                // Create new buffer source (must create new one each time)
+                this.audioSourceNode = this.audioContext.createBufferSource();
+                this.audioSourceNode.buffer = this.audioBuffer;
+
+                // Connect: source -> analyser -> destination
+                this.audioSourceNode.connect(this.analyser);
+                this.analyser.connect(this.audioContext.destination);
+                console.log('Audio graph connected: source -> analyser -> destination');
+
+                // Start video if not playing
+                if (!this.isPlaying) {
+                    this.togglePlay();
+                } else {
+                    this.startRenderLoop();
+                }
+
+                // 重置音频状态
+                this._resetAudioState();
+
+                // Play audio
+                this.audioSourceNode.start(0);
+                this.audioSourceNode.onended = () => {
+                    this.stopAudioFile();
+                };
+
+                this.btnPlayAudio.disabled = true;
+                this.btnStopAudio.disabled = false;
+                this.btnPlayAudio.textContent = 'Playing...';
+                console.log('Audio playing via BufferSource, duration:', this.audioBuffer.duration.toFixed(1) + 's');
+            }
+
+            stopAudioFile() {
+                if (this.audioSourceNode) {
+                    try {
+                        this.audioSourceNode.stop();
+                    } catch (e) {
+                        // Already stopped
+                    }
+                    this.audioSourceNode = null;
+                }
+                this.isAudioPlaying = false;
+                this.btnPlayAudio.disabled = !this.audioBuffer;
+                this.btnStopAudio.disabled = true;
+                this.btnPlayAudio.textContent = 'Play Audio';
+                this.currentMouth = 'closed';
+                this.renderFrame();
+                console.log('Audio stopped');
+            }
+
+            // ============ 音频处理核心方法 ============
+
+            _onePoleCoef(cutoffHz, updateHz) {
+                // One-pole lowpass filter coefficient
+                return 1.0 - Math.exp(-2.0 * Math.PI * cutoffHz / updateHz);
+            }
+
+            _resetAudioState() {
+                // 重置音频状态（开始播放时调用）
+                this.noise = 0.0001;
+                this.peak = 0.001;
+                this.rmsQueue = [];
+                this.envLp = 0;
+                this.envHist = [];
+                this.centHist = [];
+                this.ePrev2 = 0;
+                this.ePrev1 = 0;
+                this.lastVowelChangeTime = -999;
+                this.currentOpenShape = 'open';
+                this.audioStartTime = performance.now() / 1000;
+
+                // 重置阈值到较低的初始值
+                this.TALK_TH = 0.02;
+                this.HALF_TH = 0.08;
+                this.OPEN_TH = 0.20;
+
+                console.log('[Audio] State reset, thresholds:',
+                    `half=${(this.HALF_TH*100).toFixed(0)}% open=${(this.OPEN_TH*100).toFixed(0)}%`);
+            }
+
+            _getRawAudioFeatures() {
+                // 从 analyser 获取原始音频特征
+                if (!this.analyser || !this.dataArray) {
+                    return { rms: 0, centroid: 0 };
+                }
+
+                // 获取时域数据计算 RMS
+                const timeDomainData = new Uint8Array(this.analyser.frequencyBinCount);
+                this.analyser.getByteTimeDomainData(timeDomainData);
+
+                // 计算 RMS（均方根）
+                let sumSq = 0;
+                for (let i = 0; i < timeDomainData.length; i++) {
+                    const sample = (timeDomainData[i] - 128) / 128;  // 归一化到 -1 ~ 1
+                    sumSq += sample * sample;
+                }
+                const rms = Math.sqrt(sumSq / timeDomainData.length);
+
+                // 获取频域数据计算频谱质心
+                this.analyser.getByteFrequencyData(this.dataArray);
+                const sampleRate = this.audioContext?.sampleRate || 48000;
+                const binCount = this.dataArray.length;
+
+                let magSum = 0;
+                let freqMagSum = 0;
+                for (let i = 0; i < binCount; i++) {
+                    const mag = this.dataArray[i] + 1e-9;
+                    const freq = (i * sampleRate / 2) / binCount;
+                    magSum += mag;
+                    freqMagSum += freq * mag;
+                }
+
+                // 归一化频谱质心到 0-1
+                const centroid = magSum > 0 ? (freqMagSum / magSum) / (sampleRate * 0.5) : 0;
+
+                return { rms, centroid: Math.min(1, Math.max(0, centroid)) };
+            }
+
+            _processAudioFrame(rmsRaw, centroid) {
+                // 处理单帧音频数据，返回处理后的包络值
+                const currentTime = performance.now() / 1000 - this.audioStartTime;
+
+                // 1. 噪声底噪追踪
+                if (rmsRaw < this.noise + 0.0005) {
+                    this.noise = 0.99 * this.noise + 0.01 * rmsRaw;
+                } else {
+                    this.noise = 0.999 * this.noise + 0.001 * rmsRaw;
+                }
+
+                // 2. 峰值追踪 + 静音门限
+                this.peak = Math.max(rmsRaw, this.peak * this.peakDecay, this.noise + this.silenceGate);
+                const denom = Math.max(this.peak - this.noise, this.silenceGate);
+
+                // 3. RMS 归一化 + 开方压缩
+                let rmsNorm = Math.pow(Math.max(0, Math.min(1, (rmsRaw - this.noise) / denom)), 0.5);
+
+                // 4. 静音门限：低于门限强制为 0（防止帕克帕克）
+                if (rmsRaw < this.noise + this.silenceGate) {
+                    rmsNorm = 0;
+                }
+
+                // 5. 第一层平滑：3帧滑动平均
+                this.rmsQueue.push(rmsNorm);
+                if (this.rmsQueue.length > 3) this.rmsQueue.shift();
+                const rmsSm = this.rmsQueue.reduce((a, b) => a + b, 0) / this.rmsQueue.length;
+
+                // 6. 第二层平滑：低通滤波
+                this.envLp = this.envLp + this.beta * (rmsSm - this.envLp);
+
+                // 7. 第三层平滑：混合包络（低通 75% + 原始 25%）
+                const env = Math.min(1, Math.max(0, 0.75 * this.envLp + 0.25 * rmsSm));
+
+                // 8. 记录历史（用于自适应阈值）
+                this.envHist.push(env);
+                this.centHist.push(centroid);
+                const maxHistLen = this.audioHz * 10;  // 保留10秒
+                if (this.envHist.length > maxHistLen) {
+                    this.envHist.shift();
+                    this.centHist.shift();
+                }
+
+                // 9. 每秒更新自适应阈值
+                if (this.envHist.length > this.audioHz * 3 && this.envHist.length % this.audioHz === 0) {
+                    this._updateAdaptiveThresholds();
+                }
+
+                // 10. 确定嘴型状态
+                let mouthLevel;
+                if (env < this.TALK_TH) {
+                    mouthLevel = 'closed';
+                } else if (env < this.HALF_TH) {
+                    mouthLevel = 'closed';  // 介于 TALK 和 HALF 之间也算 closed
+                } else if (env < this.OPEN_TH) {
+                    mouthLevel = 'half';
+                } else {
+                    mouthLevel = 'open';
+                }
+
+                // 11. 元音选择（仅在 open 状态下）
+                let mouthShape = mouthLevel;
+                if (mouthLevel === 'open') {
+                    // 峰值检测：只在音量达到峰值时切换元音
+                    const isPeak = (this.ePrev2 < this.ePrev1) &&
+                                   (this.ePrev1 >= env) &&
+                                   (this.ePrev1 > this.OPEN_TH + this.peakMargin);
+
+                    if (isPeak && (currentTime - this.lastVowelChangeTime) >= this.minVowelInterval) {
+                        // 用最近5帧的平均频谱质心判断元音
+                        const recentCent = this.centHist.slice(-5);
+                        const avgCent = recentCent.length > 0
+                            ? recentCent.reduce((a, b) => a + b, 0) / recentCent.length
+                            : centroid;
+
+                        if (avgCent < this.U_TH) {
+                            this.currentOpenShape = 'u';
+                        } else if (avgCent > this.E_TH) {
+                            this.currentOpenShape = 'e';
+                        } else {
+                            this.currentOpenShape = 'open';
+                        }
+                        this.lastVowelChangeTime = currentTime;
+                    }
+                    mouthShape = this.currentOpenShape;
+                }
+
+                // 更新历史值（用于峰值检测）
+                this.ePrev2 = this.ePrev1;
+                this.ePrev1 = env;
+
+                return { env, mouthShape, rmsNorm, centroid, rmsRaw };
+            }
+
+            _updateAdaptiveThresholds() {
+                // 根据历史数据自适应更新阈值
+                const vals = [...this.envHist];
+                vals.sort((a, b) => a - b);
+
+                // 底噪：取最低 20% 的中位数
+                const k = Math.max(1, Math.floor(0.2 * vals.length));
+                const noiseFloorEnv = vals[Math.floor(k / 2)];
+                this.TALK_TH = Math.min(0.18, Math.max(0.03, noiseFloorEnv + 0.05));
+
+                // 只用超过 TALK_TH 的值计算 HALF 和 OPEN
+                const talkVals = vals.filter(v => v > this.TALK_TH);
+                if (talkVals.length > 20) {
+                    this.HALF_TH = this._percentile(talkVals, 25);
+                    this.OPEN_TH = this._percentile(talkVals, 58);
+                    this.HALF_TH = Math.max(this.HALF_TH, this.TALK_TH + 0.02);
+                    this.OPEN_TH = Math.max(this.OPEN_TH, this.HALF_TH + 0.05);
+
+                    // 用 open 时的质心更新 U/E 阈值
+                    const openMask = this.envHist.map(v => v >= this.OPEN_TH);
+                    const centOpen = this.centHist.filter((_, i) => openMask[i]);
+                    if (centOpen.length > 20) {
+                        this.U_TH = this._percentile(centOpen, 20);
+                        this.E_TH = this._percentile(centOpen, 80);
+                    }
+                }
+            }
+
+            _percentile(arr, p) {
+                // 计算百分位数
+                const sorted = [...arr].sort((a, b) => a - b);
+                const idx = Math.floor((p / 100) * sorted.length);
+                return sorted[Math.min(idx, sorted.length - 1)];
+            }
+
+            getVolume() {
+                // 兼容接口：返回用于 UI 显示的音量值（0-100）
+                const { rms } = this._getRawAudioFeatures();
+                return rms * 500;  // 放大到 0-100 范围
+            }
+
+            getMouthState() {
+                // 获取当前嘴型状态（完整处理流程）
+                const { rms, centroid } = this._getRawAudioFeatures();
+                const { mouthShape, env, rmsNorm } = this._processAudioFrame(rms, centroid);
+
+                // Debug: 每500ms打印一次
+                if (!this._debugTime || Date.now() - this._debugTime > 500) {
+                    console.log(`[Audio] rms=${(rms*1000).toFixed(1)} env=${(env*100).toFixed(0)}% ` +
+                        `TH: half=${(this.HALF_TH*100).toFixed(0)} open=${(this.OPEN_TH*100).toFixed(0)} ` +
+                        `| mouth=${mouthShape} noise=${(this.noise*1000).toFixed(2)}`);
+                    this._debugTime = Date.now();
+                }
+
+                return mouthShape;
             }
 
             testMouth() {
@@ -382,11 +876,174 @@
                 return this.mouthTrack.frames[frameIdx % this.mouthTrack.frames.length];
             }
 
+            _getScaledQuad(quad) {
+                // 根据 canvas 和 track 的原始尺寸计算缩放后的 quad
+                if (!quad || !this.mouthTrack) return null;
+
+                const trackW = this.mouthTrack.width || 1080;
+                const trackH = this.mouthTrack.height || 1920;
+                const canvasW = this.canvas.width;
+                const canvasH = this.canvas.height;
+
+                // 计算缩放比例
+                const scaleX = canvasW / trackW;
+                const scaleY = canvasH / trackH;
+
+                // 计算校准偏移（相对于 canvas 尺寸）
+                // _calibrationOffsetY 为负值时向上偏移
+                const offsetX = this._calibrationOffsetX * canvasW;
+                const offsetY = this._calibrationOffsetY * canvasH;
+
+                // Debug: 每5秒打印一次校准信息
+                if (!this._calibDebugTime || Date.now() - this._calibDebugTime > 5000) {
+                    const rawYs = quad.map(p => p[1]);
+                    const rawCy = (Math.min(...rawYs) + Math.max(...rawYs)) / 2;
+                    const scaledCy = rawCy * scaleY;
+                    const calibCy = scaledCy + offsetY;
+                    console.log(`[Calibration] Raw Y center: ${rawCy.toFixed(0)} (${(rawCy/trackH*100).toFixed(1)}%) -> Calibrated: ${calibCy.toFixed(0)} (${(calibCy/canvasH*100).toFixed(1)}%), offset: ${offsetY.toFixed(0)}px (${(this._calibrationOffsetY*100).toFixed(1)}%)`);
+                    this._calibDebugTime = Date.now();
+                }
+
+                // 应用缩放和校准偏移
+                return quad.map(p => [p[0] * scaleX + offsetX, p[1] * scaleY + offsetY]);
+            }
+
+            _isQuadReasonable(quad, prevQuad) {
+                // 检查 quad 是否合理（没有跳动太大）
+                if (!quad || quad.length !== 4) {
+                    if (!this._reasonLogTime1 || Date.now() - this._reasonLogTime1 > 5000) {
+                        console.log('[Quad] Rejected: no quad or wrong length');
+                        this._reasonLogTime1 = Date.now();
+                    }
+                    return false;
+                }
+
+                // 计算当前 quad 的中心和尺寸
+                const xs = quad.map(p => p[0]);
+                const ys = quad.map(p => p[1]);
+                const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+                const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+                const w = Math.max(...xs) - Math.min(...xs);
+                const h = Math.max(...ys) - Math.min(...ys);
+
+                // 基本合理性检查
+                const trackH = this.mouthTrack?.height || 1920;
+                const trackW = this.mouthTrack?.width || 1080;
+
+                // 嘴应该在画面中部（Y 在 25%-60% 之间）- 调整范围
+                if (cy < trackH * 0.25 || cy > trackH * 0.60) {
+                    if (!this._reasonLogTime2 || Date.now() - this._reasonLogTime2 > 5000) {
+                        console.log(`[Quad] Rejected Y position: cy=${cy.toFixed(0)} (${(cy/trackH*100).toFixed(1)}%), need 25%-60%`);
+                        this._reasonLogTime2 = Date.now();
+                    }
+                    return false;
+                }
+
+                // 宽高应该合理（不能太大或太小）
+                if (w < 30 || w > trackW * 0.5) {
+                    if (!this._reasonLogTime3 || Date.now() - this._reasonLogTime3 > 5000) {
+                        console.log(`[Quad] Rejected width: w=${w.toFixed(0)}, need 30-${trackW*0.5}`);
+                        this._reasonLogTime3 = Date.now();
+                    }
+                    return false;
+                }
+                if (h < 5 || h > trackH * 0.2) {
+                    if (!this._reasonLogTime4 || Date.now() - this._reasonLogTime4 > 5000) {
+                        console.log(`[Quad] Rejected height: h=${h.toFixed(0)}, need 5-${trackH*0.2}`);
+                        this._reasonLogTime4 = Date.now();
+                    }
+                    return false;
+                }
+
+                // 跳动检查已移除 - 只要位置在合理范围内就接受
+                // 平滑算法会处理帧间过渡
+
+                return true;
+            }
+
+            _smoothQuad(newQuad) {
+                // 自适应平滑：小变化平滑，大变化直接跳转
+                if (!this._smoothedQuad) {
+                    this._smoothedQuad = newQuad.map(p => [...p]);
+                    return this._smoothedQuad;
+                }
+
+                // 计算当前位置和目标位置的距离
+                const oldCx = this._smoothedQuad.reduce((s, p) => s + p[0], 0) / 4;
+                const oldCy = this._smoothedQuad.reduce((s, p) => s + p[1], 0) / 4;
+                const newCx = newQuad.reduce((s, p) => s + p[0], 0) / 4;
+                const newCy = newQuad.reduce((s, p) => s + p[1], 0) / 4;
+                const distance = Math.sqrt((newCx - oldCx) ** 2 + (newCy - oldCy) ** 2);
+
+                // 大幅移动（>30px）：直接跳转到新位置
+                if (distance > 30) {
+                    this._smoothedQuad = newQuad.map(p => [...p]);
+                    return this._smoothedQuad;
+                }
+
+                // 小幅移动：使用平滑
+                const alpha = this._quadSmoothingAlpha;
+                for (let i = 0; i < 4; i++) {
+                    this._smoothedQuad[i][0] = this._smoothedQuad[i][0] * (1 - alpha) + newQuad[i][0] * alpha;
+                    this._smoothedQuad[i][1] = this._smoothedQuad[i][1] * (1 - alpha) + newQuad[i][1] * alpha;
+                }
+
+                return this._smoothedQuad;
+            }
+
+            _getValidQuad(frameData) {
+                // 位置锁定模式：直接返回锁定的位置
+                if (this._lockPosition && this._lockedQuad) {
+                    return this._lockedQuad;
+                }
+
+                // Hold 策略 + 异常值过滤 + 平滑
+                let rawQuad = null;
+
+                if (frameData && frameData.valid && frameData.quad) {
+                    // 检查 quad 是否合理
+                    if (this._isQuadReasonable(frameData.quad, this._lastValidQuad)) {
+                        rawQuad = frameData.quad;
+                        this._lastValidQuad = rawQuad;
+                    } else {
+                        // 不合理，使用上一个有效值
+                        rawQuad = this._lastValidQuad;
+                    }
+                } else {
+                    // 无效帧，使用上一个有效值
+                    rawQuad = this._lastValidQuad;
+                }
+
+                if (!rawQuad) {
+                    return null;  // 没有任何有效 quad
+                }
+
+                // 应用平滑
+                return this._smoothQuad(rawQuad);
+            }
+
+            _getFixedPosition() {
+                // 固定位置后备方案（嘴部默认位置）
+                const canvasW = this.canvas.width;
+                const canvasH = this.canvas.height;
+                // 默认位置：水平居中，垂直约 42% 处
+                const cx = canvasW * 0.5;
+                const cy = canvasH * 0.42;
+                const defaultW = canvasW * 0.15;  // 默认宽度约 15%
+                const defaultH = defaultW * 0.5;  // 高度为宽度的一半
+                return {
+                    x: cx - defaultW / 2,
+                    y: cy - defaultH / 2,
+                    w: defaultW,
+                    h: defaultH
+                };
+            }
+
             renderFrame() {
                 // Clear canvas
                 this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
-                // Get current frame data
+                // Get current frame data - 简化：直接使用原始数据
                 const frameData = this.getCurrentFrame();
                 if (!frameData || !frameData.valid) return;
 
@@ -394,17 +1051,26 @@
                 const sprite = this.mouthSprites[this.currentMouth];
                 if (!sprite) return;
 
-                // Get quad from frame data
+                // Get quad from frame data - 直接使用，不做复杂处理
                 const quad = frameData.quad;
                 if (!quad || quad.length !== 4) return;
 
+                // 缩放到 canvas 尺寸
+                const trackW = this.mouthTrack?.width || 1080;
+                const trackH = this.mouthTrack?.height || 1920;
+                const scaleX = this.canvas.width / trackW;
+                const scaleY = this.canvas.height / trackH;
+
                 // Calculate bounding box from quad
-                const xs = quad.map(p => p[0]);
-                const ys = quad.map(p => p[1]);
+                const xs = quad.map(p => p[0] * scaleX);
+                const ys = quad.map(p => p[1] * scaleY);
                 const x = Math.min(...xs);
                 const y = Math.min(...ys);
                 const w = Math.max(...xs) - x;
                 const h = Math.max(...ys) - y;
+
+                // 确保尺寸有效
+                if (w < 1 || h < 1) return;
 
                 // Draw mouth sprite
                 this.ctx.drawImage(sprite, x, y, w, h);
@@ -420,10 +1086,17 @@
                 const loop = () => {
                     if (!this.isPlaying) return;
 
-                    // Update mouth state from mic
-                    if (this.isMicActive) {
+                    // Update mouth state from mic or audio file
+                    if (this.isMicActive || this.isAudioPlaying) {
+                        // 使用新的完整处理流程
+                        const newMouth = this.getMouthState();
                         const volume = this.getVolume();
-                        this.currentMouth = this.getMouthState(volume);
+
+                        // Debug: log when mouth changes
+                        if (newMouth !== this.currentMouth) {
+                            console.log(`Mouth: ${this.currentMouth} -> ${newMouth}`);
+                        }
+                        this.currentMouth = newMouth;
 
                         // Update volume display
                         this.statusVolume.textContent = Math.round(volume);
@@ -481,6 +1154,25 @@
 
                 if (Object.keys(tuber.mouthSprites).length > 0) {
                     tuber.btnMic.disabled = false;
+                }
+
+                // Auto-load test audio
+                try {
+                    const audioResp = await fetch('test_audio.wav');
+                    if (audioResp.ok) {
+                        const arrayBuffer = await audioResp.arrayBuffer();
+                        tuber._audioArrayBuffer = arrayBuffer.slice(0);
+                        tuber.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        tuber.analyser = tuber.audioContext.createAnalyser();
+                        tuber.analyser.fftSize = 256;
+                        tuber.analyser.smoothingTimeConstant = 0.3;
+                        tuber.dataArray = new Uint8Array(tuber.analyser.frequencyBinCount);
+                        tuber.audioBuffer = await tuber.audioContext.decodeAudioData(arrayBuffer);
+                        tuber.btnPlayAudio.disabled = false;
+                        console.log('Auto-loaded test audio: test_audio.wav');
+                    }
+                } catch (e) {
+                    console.log('No test audio found');
                 }
             } catch (e) {
                 console.log('Auto-load failed, use file picker:', e);
